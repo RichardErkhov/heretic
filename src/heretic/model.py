@@ -27,6 +27,7 @@ from transformers import (
 from transformers.generation import (
     GenerateDecoderOnlyOutput,
 )
+
 try:
     from transformers.masking_utils import create_causal_mask
 except ImportError:  # Transformers < 5
@@ -992,9 +993,7 @@ class Model:
 
         return residuals
 
-    def _stream_forward(
-        self, prompts: list[Prompt]
-    ) -> tuple[list[Tensor], Tensor]:
+    def _stream_forward(self, prompts: list[Prompt]) -> tuple[list[Tensor], Tensor]:
         """
         Layer-by-layer streamed forward pass: weights stay in CPU memory and each
         layer is moved to the compute device only while it computes, for setups where
@@ -1047,7 +1046,8 @@ class Model:
 
         # Move inputs to the embedding module's device. On multi-device setups, the
         # Accelerate alignment hooks take care of further transfers automatically.
-        device = embedding.weight.device
+        # Cast: get_input_embeddings() is only annotated as a bare Module.
+        device = cast(torch.device, embedding.weight.device)
         input_ids = inputs["input_ids"].to(device)
         attention_mask = inputs["attention_mask"].to(device)
 
@@ -1070,7 +1070,9 @@ class Model:
         else:
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
-            causal = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device).tril()
+            causal = torch.ones(
+                seq_len, seq_len, dtype=torch.bool, device=device
+            ).tril()
             allowed = attention_mask[:, None, None, :].bool() & causal
             causal_mask = (1.0 - allowed.to(hidden_states.dtype)) * torch.finfo(
                 hidden_states.dtype
@@ -1124,9 +1126,7 @@ class Model:
 
         raise TypeError("Decoder layer rejected both full and reduced keyword sets.")
 
-    def _eager_forward_once(
-        self, prompts: list[Prompt]
-    ) -> tuple[list[Tensor], Tensor]:
+    def _eager_forward_once(self, prompts: list[Prompt]) -> tuple[list[Tensor], Tensor]:
         _, outputs = self.generate(
             prompts,
             max_new_tokens=1,

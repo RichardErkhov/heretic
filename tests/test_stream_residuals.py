@@ -1,8 +1,14 @@
+from typing import ClassVar, cast
 from unittest import TestCase, main
 from unittest.mock import patch
 
 import torch
-from transformers import BatchEncoding, LlamaConfig, LlamaForCausalLM
+from transformers import (
+    BatchEncoding,
+    LlamaConfig,
+    LlamaForCausalLM,
+    PreTrainedTokenizerBase,
+)
 
 from heretic.config import Settings
 from heretic.model import Model
@@ -34,7 +40,7 @@ def make_model(stream: bool) -> Model:
     with patch("sys.argv", ["heretic"]):
         model.settings = Settings(model="stub", stream_layers=stream)
     model.supports_system_role = True
-    model.tokenizer = StubTokenizer()
+    model.tokenizer = cast(PreTrainedTokenizerBase, StubTokenizer())
     model.stream_fallback_reason = None
     config = LlamaConfig(
         hidden_size=16,
@@ -52,7 +58,7 @@ def make_model(stream: bool) -> Model:
 
 
 class StreamedLayersTests(TestCase):
-    prompts = [
+    prompts: ClassVar[list[Prompt]] = [
         Prompt(system="", user="hello"),
         Prompt(system="", user="a somewhat longer prompt"),
     ]
