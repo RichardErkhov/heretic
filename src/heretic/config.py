@@ -297,6 +297,16 @@ class Settings(BaseSettings):
         exclude=True,
     )
 
+    stream_layers: bool = Field(
+        default=False,
+        description=(
+            "Whether to keep model weights in CPU memory and stream them layer by layer "
+            "to the compute device during analysis passes, instead of keeping the whole "
+            "model resident in VRAM. Allows modifying models that do not fit into VRAM, "
+            "at the cost of some speed."
+        ),
+    )
+
     batch_size_test_prompts: DatasetSpecification = Field(
         default=SingleDatasetSpecification(
             dataset="mlabonne/harmless_alpaca",

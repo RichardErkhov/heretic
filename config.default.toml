@@ -39,6 +39,10 @@ batch_size = 0  # auto
 # Maximum batch size to try when automatically determining the optimal batch size.
 max_batch_size = 128
 
+# Keep model weights in CPU memory and stream them layer by layer to the compute
+# device during analysis passes, instead of keeping the whole model resident in VRAM.
+stream_layers = false
+
 # Maximum number of tokens to generate for each response.
 max_response_length = 100
 

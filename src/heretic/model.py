@@ -27,6 +27,10 @@ from transformers import (
 from transformers.generation import (
     GenerateDecoderOnlyOutput,
 )
+try:
+    from transformers.masking_utils import create_causal_mask
+except ImportError:  # Transformers < 5
+    create_causal_mask = None
 
 from .config import QuantizationMethod, Settings
 from .system import empty_cache
@@ -144,6 +148,7 @@ class Model:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.needs_reload = False
+        self.stream_fallback_reason: str | None = None
 
         self.revision_kwargs = {}
         if settings.model_commit is not None:
@@ -588,11 +593,7 @@ class Model:
             result.append({"role": "user", "content": "\n\n".join(pending)})
         return result
 
-    def generate(
-        self,
-        prompts: list[Prompt],
-        **kwargs: Any,
-    ) -> tuple[BatchEncoding, GenerateDecoderOnlyOutput | LongTensor]:
+    def _render_chat_prompts(self, prompts: list[Prompt]) -> list[str]:
         chats = [
             self._apply_system_role(
                 [
@@ -622,6 +623,15 @@ class Model:
             chat_prompts = [
                 prompt + self.settings.response_prefix for prompt in chat_prompts
             ]
+
+        return chat_prompts
+
+    def generate(
+        self,
+        prompts: list[Prompt],
+        **kwargs: Any,
+    ) -> tuple[BatchEncoding, GenerateDecoderOnlyOutput | LongTensor]:
+        chat_prompts = self._render_chat_prompts(prompts)
 
         inputs = self.tokenizer(
             chat_prompts,
@@ -681,6 +691,10 @@ class Model:
         prompts: list[Prompt],
         winsorization_quantile: float = 1.0,
     ) -> Tensor:
+        if self.settings.stream_layers:
+            layer_states, _ = self._stream_forward(prompts)
+            return self._finish_residuals(layer_states, winsorization_quantile)
+
         # We only generate one token, and we return the residual vectors
         # at that token position, for each prompt and layer.
         _, outputs = self.generate(
@@ -697,59 +711,12 @@ class Model:
         # of model.generate with return_dict_in_generate=True.
         outputs = cast(GenerateDecoderOnlyOutput, outputs)
 
-        # Hidden states for the first (only) generated token.
-        # This cast is valid because we passed output_hidden_states=True above.
         hidden_states = cast(tuple[tuple[FloatTensor]], outputs.hidden_states)[0]
 
-        # Models with Hyper-Connections (e.g. DeepSeek V4 and GLM 5.3) have several
-        # residual streams, so their hidden states have shape
-        # (prompt, position, stream, component). We use the mean of the streams.
-        # The last entry has no stream dimension, because Transformers replaces it
-        # with the model output, where the streams have already been merged.
-        hidden_states = tuple(
-            (
-                layer_hidden_states.mean(dim=2)
-                if layer_hidden_states.dim() == 4
-                else layer_hidden_states
-            )
-            for layer_hidden_states in hidden_states
-        )
-
-        hidden_states = _collapse_flattened_residual_streams(
-            cast(tuple[FloatTensor, ...], hidden_states),
-            self.model.config,
-        )
-
-        # The returned tensor has shape (prompt, layer, component).
-        residuals = torch.stack(
-            # layer_hidden_states has shape (prompt, position, component),
-            # so this extracts the hidden states at the end of each prompt,
-            # and stacks them up over the layers.
+        return self._finish_residuals(
             [layer_hidden_states[:, -1, :] for layer_hidden_states in hidden_states],
-            dim=1,
+            winsorization_quantile,
         )
-
-        # Upcast the data type to avoid precision (bfloat16) or range (float16)
-        # problems during calculations involving residual vectors.
-        residuals = residuals.to(torch.float32)
-
-        if 0 <= winsorization_quantile < 1:
-            # Apply symmetric winsorization to each layer of the per-prompt residuals.
-            abs_residuals = torch.abs(residuals)
-            # Get the (prompt, layer, 1) quantiles of the (prompt, layer, component) residuals.
-            thresholds = torch.quantile(
-                abs_residuals,
-                winsorization_quantile,
-                dim=2,
-                keepdim=True,
-            )
-            residuals = torch.clamp(residuals, -thresholds, thresholds)
-
-        if self.settings.offload_outputs_to_cpu:
-            residuals = residuals.cpu()
-            empty_cache()
-
-        return residuals
 
     def get_residuals_batched(
         self,
@@ -859,11 +826,16 @@ class Model:
                         )
                     )
 
-        self.generate(
-            prompts,
-            max_new_tokens=1,
-            use_cache=False,
-        )
+        if self.settings.stream_layers:
+            # The forward hooks installed above capture the module I/O regardless
+            # of which forward path runs.
+            self._stream_forward(prompts)
+        else:
+            self.generate(
+                prompts,
+                max_new_tokens=1,
+                use_cache=False,
+            )
 
         for hook_handle in hook_handles:
             hook_handle.remove()
@@ -930,6 +902,13 @@ class Model:
         return module_io
 
     def get_logits(self, prompts: list[Prompt]) -> Tensor:
+        if self.settings.stream_layers:
+            _, logits = self._stream_forward(prompts)
+            if self.settings.offload_outputs_to_cpu:
+                logits = logits.cpu()
+                empty_cache()
+            return logits
+
         # We only generate one token, and we return the raw logits over the vocabulary
         # at that token position, for each prompt.
         _, outputs = self.generate(
@@ -965,6 +944,208 @@ class Model:
             logits.append(self.get_logits(batch))
 
         return torch.cat(logits, dim=0)
+
+    def _finish_residuals(
+        self,
+        layer_states: list[Tensor],
+        winsorization_quantile: float,
+    ) -> Tensor:
+        # Models with Hyper-Connections (e.g. DeepSeek V4 and GLM 5.3) have several
+        # residual streams, so their hidden states at the last prompt position have
+        # shape (prompt, stream, component). We use the mean of the streams.
+        # The last entry has no stream dimension, because Transformers replaces it
+        # with the model output, where the streams have already been merged.
+        layer_states = [
+            layer_state.mean(dim=1) if layer_state.dim() == 3 else layer_state
+            for layer_state in layer_states
+        ]
+
+        layer_states = list(
+            _collapse_flattened_residual_streams(
+                cast(tuple[FloatTensor, ...], tuple(layer_states)),
+                self.model.config,
+            )
+        )
+
+        # The returned tensor has shape (prompt, layer, component).
+        residuals = torch.stack(layer_states, dim=1)
+
+        # Upcast the data type to avoid precision (bfloat16) or range (float16)
+        # problems during calculations involving residual vectors.
+        residuals = residuals.to(torch.float32)
+
+        if 0 <= winsorization_quantile < 1:
+            # Apply symmetric winsorization to each layer of the per-prompt residuals.
+            abs_residuals = torch.abs(residuals)
+            # Get the (prompt, layer, 1) quantiles of the (prompt, layer, component) residuals.
+            thresholds = torch.quantile(
+                abs_residuals,
+                winsorization_quantile,
+                dim=2,
+                keepdim=True,
+            )
+            residuals = torch.clamp(residuals, -thresholds, thresholds)
+
+        if self.settings.offload_outputs_to_cpu:
+            residuals = residuals.cpu()
+            empty_cache()
+
+        return residuals
+
+    def _stream_forward(
+        self, prompts: list[Prompt]
+    ) -> tuple[list[Tensor], Tensor]:
+        """
+        Layer-by-layer streamed forward pass: weights stay in CPU memory and each
+        layer is moved to the compute device only while it computes, for setups where
+        the whole model does not fit into VRAM. Returns the hidden state at the last
+        prompt position for each layer boundary that Transformers records (embedding
+        output, intermediate layer outputs, final norm output), plus next-token logits.
+        """
+        with torch.no_grad():
+            if self.stream_fallback_reason is None:
+                try:
+                    return self._stream_forward_once(prompts)
+                except Exception as error:
+                    self.stream_fallback_reason = format_exception(error)
+                    print(
+                        f"* Streamed forward unavailable ({self.stream_fallback_reason}), falling back to eager forward."
+                    )
+
+            return self._eager_forward_once(prompts)
+
+    def _stream_forward_once(
+        self, prompts: list[Prompt]
+    ) -> tuple[list[Tensor], Tensor]:
+        chat_prompts = self._render_chat_prompts(prompts)
+
+        inputs = self.tokenizer(
+            chat_prompts,
+            padding=True,
+            return_tensors="pt",
+            return_token_type_ids=False,
+        )
+
+        model = self.model
+
+        # Unwrap PeftModel (always true after _apply_lora), then locate the module
+        # owning the transformer layers (mirrors get_layers()).
+        outer = model.base_model.model if isinstance(model, PeftModel) else model
+        inner = getattr(outer, "model", outer)
+
+        # Multimodal models keep their text stack in language_model.
+        root = getattr(inner, "language_model", inner)
+
+        layers = self.get_layers()
+        norm = getattr(root, "norm", None)
+        lm_head = (
+            getattr(root, "lm_head", None)
+            or getattr(outer, "lm_head", None)
+            or model.lm_head
+        )
+        embedding = model.get_input_embeddings()
+
+        # Move inputs to the embedding module's device. On multi-device setups, the
+        # Accelerate alignment hooks take care of further transfers automatically.
+        device = embedding.weight.device
+        input_ids = inputs["input_ids"].to(device)
+        attention_mask = inputs["attention_mask"].to(device)
+
+        hidden_states = embedding(input_ids)
+
+        # Mirror the model's own forward pass exactly: Transformers 5 derives plain arange
+        # position ids and the combined causal+padding mask via `create_causal_mask`; older
+        # versions use cumsum-based ids derived from the padding mask. Using anything else
+        # shifts every attention row and changes which token wins the argmax.
+        seq_len = input_ids.shape[1]
+        if create_causal_mask is not None:
+            position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+            causal_mask = create_causal_mask(
+                config=getattr(root, "config", model.config),
+                inputs_embeds=hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=None,
+                position_ids=position_ids,
+            )
+        else:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            causal = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device).tril()
+            allowed = attention_mask[:, None, None, :].bool() & causal
+            causal_mask = (1.0 - allowed.to(hidden_states.dtype)) * torch.finfo(
+                hidden_states.dtype
+            ).min
+
+        rotary_embedding = getattr(root, "rotary_emb", None)
+        position_embeddings = None
+        if rotary_embedding is not None:
+            position_embeddings = rotary_embedding(hidden_states, position_ids)
+
+        layer_states: list[Tensor] = []
+
+        kwargs: dict[str, Any] = {
+            "attention_mask": causal_mask,
+            "position_ids": position_ids,
+        }
+        if position_embeddings is not None:
+            kwargs["position_embeddings"] = position_embeddings
+
+        for layer in layers:
+            # Mirrors Transformers' hidden-states collection: record the state entering
+            # each layer, then finally the normed last-layer output. Only the activation
+            # at the last prompt position is needed; keeping full sequences for all
+            # layers would defeat the purpose of streaming.
+            layer_states.append(hidden_states[:, -1, :].detach().cpu())
+            hidden_states = self._call_layer(layer, hidden_states, kwargs)
+
+        if norm is not None:
+            hidden_states = norm(hidden_states)
+
+        layer_states.append(hidden_states[:, -1, :].detach().cpu())
+
+        logits = lm_head(hidden_states)[:, -1, :]
+
+        return layer_states, logits
+
+    def _call_layer(
+        self, layer: Module, hidden_states: Tensor, kwargs: dict[str, Any]
+    ) -> Tensor:
+        # (older decoder layers have no `position_embeddings` parameter and compute
+        # rotary embeddings themselves), so retry with a reduced set on TypeError.
+        for reduced in (False, True):
+            call_kwargs = dict(kwargs)
+            if reduced:
+                call_kwargs.pop("position_embeddings", None)
+            try:
+                outputs = layer(hidden_states, use_cache=False, **call_kwargs)
+            except TypeError:
+                continue
+            return outputs[0] if isinstance(outputs, tuple) else outputs
+
+        raise TypeError("Decoder layer rejected both full and reduced keyword sets.")
+
+    def _eager_forward_once(
+        self, prompts: list[Prompt]
+    ) -> tuple[list[Tensor], Tensor]:
+        _, outputs = self.generate(
+            prompts,
+            max_new_tokens=1,
+            output_hidden_states=True,
+            output_logits=True,
+            return_dict_in_generate=True,
+            use_cache=False,
+        )
+
+        # This cast is valid because GenerateDecoderOnlyOutput is the return type
+        # of model.generate with return_dict_in_generate=True.
+        outputs = cast(GenerateDecoderOnlyOutput, outputs)
+
+        # This cast is valid because we passed output_hidden_states=True above.
+        hidden_states = cast(tuple[tuple[FloatTensor]], outputs.hidden_states)[0]
+
+        logits = cast(tuple[FloatTensor], outputs.logits)[0]
+
+        return [hs[:, -1, :] for hs in hidden_states], logits
 
     def stream_chat_response(self, chat: list[dict[str, str]]) -> str:
         chat = self._apply_system_role(chat)
