@@ -210,6 +210,11 @@ class Model:
                 # (some models like gpt-oss have issues with explicit None).
                 if quantization_config is not None:
                     extra_kwargs["quantization_config"] = quantization_config
+                # Streaming relies on accelerate placing modules across GPU/CPU tiers;
+                # lazy loading would leave tail modules as meta, which fails the
+                # residency check below. Materialize eagerly when streaming.
+                if settings.stream_layers:
+                    extra_kwargs["low_cpu_mem_usage"] = False
 
                 self.model = get_model_class(settings.model).from_pretrained(
                     settings.model,
@@ -352,6 +357,9 @@ class Model:
                 bnb_4bit_compute_dtype=compute_dtype,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=True,
+                # Hierarchical device_map keeps some layers on CPU; this flag is
+                # what makes transformers accept that mix instead of rejecting it.
+                llm_int8_enable_fp32_cpu_offload=True,
             )
         return None
 
@@ -441,6 +449,9 @@ class Model:
         extra_kwargs = {}
         if quantization_config is not None:
             extra_kwargs["quantization_config"] = quantization_config
+        # See __init__: streamed runs need eager materialization.
+        if self.settings.stream_layers:
+            extra_kwargs["low_cpu_mem_usage"] = False
 
         self.model = get_model_class(self.settings.model).from_pretrained(
             self.settings.model,
@@ -995,11 +1006,12 @@ class Model:
 
     def _stream_forward(self, prompts: list[Prompt]) -> tuple[list[Tensor], Tensor]:
         """
-        Layer-by-layer streamed forward pass: weights stay in CPU memory and each
-        layer is moved to the compute device only while it computes, for setups where
-        the whole model does not fit into VRAM. Returns the hidden state at the last
-        prompt position for each layer boundary that Transformers records (embedding
-        output, intermediate layer outputs, final norm output), plus next-token logits.
+        Layer-by-layer streamed forward pass: each layer's weights are read from disk
+        onto the compute device when the layer is touched and evicted afterwards, so
+        peak memory stays about one layer plus activations and cached IO on hosts
+        where the whole model does not fit into VRAM. Returns the hidden state at the
+        last prompt position for each layer boundary that Transformers records
+        (embedding output, intermediate layer outputs, final norm output), plus logits.
         """
         with torch.no_grad():
             if self.stream_fallback_reason is None:
@@ -1044,10 +1056,19 @@ class Model:
         )
         embedding = model.get_input_embeddings()
 
-        # Move inputs to the embedding module's device. On multi-device setups, the
-        # Accelerate alignment hooks take care of further transfers automatically.
-        # Cast: get_input_embeddings() is only annotated as a bare Module.
-        device = cast(torch.device, embedding.weight.device)
+        # Streamed mode keeps decoder-layer weights outside VRAM: each layer is
+        # moved onto the compute device when touched and evicted afterwards
+        # (see _call_layer). Embedding, norm and lm_head are hit by every
+        # forward pass, so they stay resident there.
+        device = (
+            torch.device("cuda")
+            if torch.cuda.is_available()
+            else cast(torch.device, embedding.weight.device)
+        )
+        embedding.to(device)
+        lm_head.to(device)
+        if norm is not None:
+            norm.to(device)
         input_ids = inputs["input_ids"].to(device)
         attention_mask = inputs["attention_mask"].to(device)
 
@@ -1081,6 +1102,7 @@ class Model:
         rotary_embedding = getattr(root, "rotary_emb", None)
         position_embeddings = None
         if rotary_embedding is not None:
+            rotary_embedding.to(device)
             position_embeddings = rotary_embedding(hidden_states, position_ids)
 
         layer_states: list[Tensor] = []
@@ -1112,19 +1134,33 @@ class Model:
     def _call_layer(
         self, layer: Module, hidden_states: Tensor, kwargs: dict[str, Any]
     ) -> Tensor:
-        # (older decoder layers have no `position_embeddings` parameter and compute
-        # rotary embeddings themselves), so retry with a reduced set on TypeError.
-        for reduced in (False, True):
-            call_kwargs = dict(kwargs)
-            if reduced:
-                call_kwargs.pop("position_embeddings", None)
-            try:
-                outputs = layer(hidden_states, use_cache=False, **call_kwargs)
-            except TypeError:
-                continue
-            return outputs[0] if isinstance(outputs, tuple) else outputs
+        # Load layer -> run everything queued through it -> unload: the layer is
+        # moved onto the compute device when touched and evicted afterwards, so
+        # peak VRAM stays around the largest layer plus activations instead of
+        # the whole model. With a single-device load this is a no-op.
+        origin = next(layer.parameters()).device
+        compute = hidden_states.device
+        moved = origin != compute
+        if moved:
+            layer.to(compute)
+        try:
+            # (older decoder layers have no `position_embeddings` parameter and compute
+            # rotary embeddings themselves), so retry with a reduced set on TypeError.
+            for reduced in (False, True):
+                call_kwargs = dict(kwargs)
+                if reduced:
+                    call_kwargs.pop("position_embeddings", None)
+                try:
+                    outputs = layer(hidden_states, use_cache=False, **call_kwargs)
+                except TypeError:
+                    continue
+                return outputs[0] if isinstance(outputs, tuple) else outputs
 
-        raise TypeError("Decoder layer rejected both full and reduced keyword sets.")
+            raise TypeError("Decoder layer rejected both full and reduced keyword sets.")
+        finally:
+            if moved:
+                layer.to(origin)
+                empty_cache()
 
     def _eager_forward_once(self, prompts: list[Prompt]) -> tuple[list[Tensor], Tensor]:
         _, outputs = self.generate(

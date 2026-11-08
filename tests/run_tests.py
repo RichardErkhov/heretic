@@ -42,6 +42,7 @@ for test_directory in script_directory.iterdir():
                 [
                     "uv",
                     "run",
+                    "--no-sync",
                     "--project",
                     project_directory,
                     "--directory",
