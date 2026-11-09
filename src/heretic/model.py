@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+import os
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime, timezone
@@ -33,6 +34,11 @@ try:
 except ImportError:  # Transformers < 5
     create_causal_mask = None
 
+try:
+    from transformers.masking_utils import create_recurrent_attention_mask
+except ImportError:  # Transformers without recurrent-mask helper
+    create_recurrent_attention_mask = None
+
 from .config import QuantizationMethod, Settings
 from .system import empty_cache
 from .utils import Prompt, batchify, format_exception, print
@@ -49,10 +55,18 @@ def get_model_class(
         return AutoModelForCausalLM
 
 
-def check_model_resident(model: PreTrainedModel | PeftModel) -> None:
+def check_model_resident(
+    model: PreTrainedModel | PeftModel, streamed: bool = False
+) -> None:
     """
     Ensure that all of the model's weights are resident in memory.
+
+    Streamed runs tolerate meta placeholders: their weights are loaded from
+    disk layer by layer when touched (see `_call_layer`), so the check only
+    constrains eager runs.
     """
+    if streamed:
+        return
     offloaded = [name for name, param in model.named_parameters() if param.is_meta]
 
     if not offloaded:
@@ -194,8 +208,28 @@ class Model:
         self.max_memory = (
             {int(k) if k.isdigit() else k: v for k, v in settings.max_memory.items()}
             if settings.max_memory
-            else None
+                # Disk-first streaming: accelerate only spills to the offload
+                # folder when max_memory carries an explicit "disk" bucket;
+                # without it every layer past the RAM bucket just stays in CPU
+                # RAM. With the disk bucket, each layer is read back from disk
+                # when touched, so peak RAM is about one layer, not the model.
+                else ({"cpu": "2GB", **({0: "6GB"} if torch.cuda.is_available() else {}),
+                       "disk": float("inf")} if settings.stream_layers else None)
         )
+
+        if settings.stream_layers and os.name == "nt":
+            # Windows counts warm file pages in process RSS, so a disk-streamed
+            # load looks RAM-backed even though only the touched layer is ever
+            # needed. Cap the working set: the OS then trims the disk cache
+            # towards the layer working set instead of the whole checkpoint.
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetCurrentProcess()
+            kernel32.SetProcessWorkingSetSize(
+                handle, ctypes.c_size_t(512 * 2**20), ctypes.c_size_t(8 * 2**30)
+            )
+            ctypes.WinDLL("psapi").EmptyWorkingSet(handle)
 
         self.trusted_models = set()
 
@@ -210,11 +244,14 @@ class Model:
                 # (some models like gpt-oss have issues with explicit None).
                 if quantization_config is not None:
                     extra_kwargs["quantization_config"] = quantization_config
-                # Streaming relies on accelerate placing modules across GPU/CPU tiers;
-                # lazy loading would leave tail modules as meta, which fails the
-                # residency check below. Materialize eagerly when streaming.
+                # Streaming keeps weights on disk: layers feed the compute
+                # device as they are touched, and accelerate spills everything
+                # beyond the buckets into offload safetensors.
                 if settings.stream_layers:
-                    extra_kwargs["low_cpu_mem_usage"] = False
+                    extra_kwargs["low_cpu_mem_usage"] = True
+                    # Needed when offloaded weights must be re-saved (renamed or
+                    # MoE-packed tensors); plain safetensors are indexed in place.
+                    extra_kwargs["offload_folder"] = "hf-cache/offload"
 
                 self.model = get_model_class(settings.model).from_pretrained(
                     settings.model,
@@ -271,7 +308,7 @@ class Model:
         if self.model is None:
             raise Exception("Failed to load model with all configured dtypes.")
 
-        check_model_resident(self.model)
+        check_model_resident(self.model, settings.stream_layers)
 
         print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
 
@@ -449,9 +486,11 @@ class Model:
         extra_kwargs = {}
         if quantization_config is not None:
             extra_kwargs["quantization_config"] = quantization_config
-        # See __init__: streamed runs need eager materialization.
+        # See __init__: streamed runs load lazily from disk.
         if self.settings.stream_layers:
-            extra_kwargs["low_cpu_mem_usage"] = False
+            extra_kwargs["low_cpu_mem_usage"] = True
+            extra_kwargs["disable_mmap"] = True
+            extra_kwargs["offload_folder"] = "hf-cache/offload"
 
         self.model = get_model_class(self.settings.model).from_pretrained(
             self.settings.model,
@@ -465,7 +504,7 @@ class Model:
             **extra_kwargs,
         )
 
-        check_model_resident(self.model)
+        check_model_resident(self.model, self.settings.stream_layers)
 
         self.needs_reload = False
 
@@ -638,11 +677,36 @@ class Model:
 
         return chat_prompts
 
+    @property
+    def compute_device(self) -> torch.device:
+        # The input embedding is what consumes the token ids, and the streamed
+        # path parks it on the compute device; `model.device` can report a
+        # stale value for multi-tower checkpoints. A disk-offloaded embedding
+        # rests on the meta device, so fall back to where activations run.
+        embedding = self.model.get_input_embeddings()
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if embedding.weight.is_meta:
+            return torch.device("cpu")
+        return cast(torch.device, embedding.weight.device)
+
     def generate(
         self,
         prompts: list[Prompt],
         **kwargs: Any,
     ) -> tuple[BatchEncoding, GenerateDecoderOnlyOutput | LongTensor]:
+        if self.settings.stream_layers:
+            return self._generate_streamed(prompts, **kwargs)
+
+        return self._eager_generate(prompts, **kwargs)
+
+    def _eager_generate(
+        self,
+        prompts: list[Prompt],
+        **kwargs: Any,
+    ) -> tuple[BatchEncoding, GenerateDecoderOnlyOutput | LongTensor]:
+        # Plain HF forward/generate. Separate from generate() so the streamed
+        # path and its fallback can call it without re-entering the dispatch.
         chat_prompts = self._render_chat_prompts(prompts)
 
         inputs = self.tokenizer(
@@ -650,7 +714,7 @@ class Model:
             return_tensors="pt",
             padding=True,
             return_token_type_ids=False,
-        ).to(self.model.device)
+        ).to(self.compute_device)
 
         # FIXME: The type checker has been disabled here because of the extremely complex
         #        interplay between different generate() signatures and dynamic delegation.
@@ -660,6 +724,54 @@ class Model:
             pad_token_id=self.tokenizer.pad_token_id,
             do_sample=False,  # Use greedy decoding to ensure deterministic outputs.
         )  # ty:ignore[call-non-callable]
+
+        return inputs, outputs
+
+    def _generate_streamed(
+        self, prompts: list[Prompt], **kwargs: Any
+    ) -> tuple[BatchEncoding, LongTensor]:
+        # Greedy decoding on top of the streamed forward: every step re-runs
+        # the layer-streaming pass over prompt plus continuation, so weights
+        # never need to stay resident between steps (no KV cache). Responses
+        # are capped at a few dozen tokens, keeping the recompute cheap; the
+        # decoded pieces are concatenated as text and re-tokenized together.
+        max_new_tokens = int(kwargs.get("max_new_tokens", 20))
+
+        chat_prompts = self._render_chat_prompts(prompts)
+        continuations = [""] * len(chat_prompts)
+        eos_token_id = self.tokenizer.eos_token_id
+        finished = [False] * len(chat_prompts)
+
+        for _ in range(max_new_tokens):
+            _, logits = self._stream_forward(prompts, continuations)
+
+            for row, token_id in enumerate(logits.argmax(dim=-1).tolist()):
+                if finished[row]:
+                    continue
+                if token_id == eos_token_id:
+                    finished[row] = True
+                else:
+                    continuations[row] += self.tokenizer.decode([token_id])
+
+            if all(finished):
+                break
+
+        inputs = self.tokenizer(
+            chat_prompts,
+            padding=True,
+            return_tensors="pt",
+            return_token_type_ids=False,
+        ).to(self.compute_device)
+
+        outputs = self.tokenizer(
+            [
+                prompt + text
+                for prompt, text in zip(chat_prompts, continuations)
+            ],
+            padding=True,
+            return_tensors="pt",
+            return_token_type_ids=False,
+        )["input_ids"].to(self.compute_device)
 
         return inputs, outputs
 
@@ -1004,7 +1116,9 @@ class Model:
 
         return residuals
 
-    def _stream_forward(self, prompts: list[Prompt]) -> tuple[list[Tensor], Tensor]:
+    def _stream_forward(
+        self, prompts: list[Prompt], suffixes: list[str] | None = None
+    ) -> tuple[list[Tensor], Tensor]:
         """
         Layer-by-layer streamed forward pass: each layer's weights are read from disk
         onto the compute device when the layer is touched and evicted afterwards, so
@@ -1016,7 +1130,7 @@ class Model:
         with torch.no_grad():
             if self.stream_fallback_reason is None:
                 try:
-                    return self._stream_forward_once(prompts)
+                    return self._stream_forward_once(prompts, suffixes)
                 except Exception as error:
                     self.stream_fallback_reason = format_exception(error)
                     print(
@@ -1026,9 +1140,17 @@ class Model:
             return self._eager_forward_once(prompts)
 
     def _stream_forward_once(
-        self, prompts: list[Prompt]
+        self, prompts: list[Prompt], suffixes: list[str] | None = None
     ) -> tuple[list[Tensor], Tensor]:
         chat_prompts = self._render_chat_prompts(prompts)
+        if suffixes is not None:
+            # Continuations follow the rendered chat text directly, exactly
+            # like decoded tokens appended in the eager path. The eager
+            # fallback ignores them (see _eager_forward_once).
+            chat_prompts = [
+                prompt + suffix
+                for prompt, suffix in zip(chat_prompts, suffixes)
+            ]
 
         inputs = self.tokenizer(
             chat_prompts,
@@ -1060,67 +1182,118 @@ class Model:
         # moved onto the compute device when touched and evicted afterwards
         # (see _call_layer). Embedding, norm and lm_head are hit by every
         # forward pass, so they stay resident there.
-        device = (
-            torch.device("cuda")
-            if torch.cuda.is_available()
-            else cast(torch.device, embedding.weight.device)
-        )
-        embedding.to(device)
-        lm_head.to(device)
+        device = self.compute_device
+        # accelerate's disk-offload keeps unloaded weights as meta tensors and fills them when the module is called; a manual `.to()` cannot copy out of meta and would drop the weights.
+        def to_compute(module: Module) -> None:
+            tensor = next(module.parameters(), None)
+            if tensor is None:
+                # Rotary-style modules hold only buffers (inv_freq etc.).
+                tensor = next(module.buffers(), None)
+            if tensor is None or not tensor.is_meta:
+                module.to(device)
+
+        to_compute(embedding)
+        to_compute(lm_head)
         if norm is not None:
-            norm.to(device)
+            to_compute(norm)
         input_ids = inputs["input_ids"].to(device)
         attention_mask = inputs["attention_mask"].to(device)
 
         hidden_states = embedding(input_ids)
 
-        # Mirror the model's own forward pass exactly: Transformers 5 derives plain arange
-        # position ids and the combined causal+padding mask via `create_causal_mask`; older
-        # versions use cumsum-based ids derived from the padding mask. Using anything else
-        # shifts every attention row and changes which token wins the argmax.
-        seq_len = input_ids.shape[1]
+        # Mirror the model's own forward pass exactly: Transformers 5 derives
+        # padding-aware position ids and attention masks via the helpers in
+        # `transformers.masking_utils`; older versions build the ids and the
+        # combined causal+padding mask by hand. Using anything else shifts
+        # every attention row and changes which token wins the argmax.
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(attention_mask == 0, 0)
+        root_config = getattr(root, "config", model.config)
         if create_causal_mask is not None:
-            position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
-            causal_mask = create_causal_mask(
-                config=getattr(root, "config", model.config),
-                inputs_embeds=hidden_states,
-                attention_mask=attention_mask,
-                past_key_values=None,
-                position_ids=position_ids,
+            mask_kwargs = {
+                "config": root_config,
+                "inputs_embeds": hidden_states,
+                "attention_mask": attention_mask,
+                "past_key_values": None,
+                "position_ids": position_ids,
+            }
+            full_mask = create_causal_mask(**mask_kwargs)
+            layer_types = list(getattr(root_config, "layer_types", None) or [])
+            hybrid = (
+                len(set(layer_types)) > 1
+                and len(layer_types) == len(layers)
+                and create_recurrent_attention_mask is not None
             )
+            if hybrid:
+                # Hybrid stacks (e.g. Qwen3.5) mix full-attention and recurrent
+                # layers, and the text tower feeds each layer type its own mask.
+                recurrent_mask = create_recurrent_attention_mask(**mask_kwargs)
+                masks_by_type = {
+                    layer_type: recurrent_mask
+                    if layer_type == "linear_attention"
+                    else full_mask
+                    for layer_type in set(layer_types)
+                }
+                causal_masks = [masks_by_type[layer_type] for layer_type in layer_types]
+            else:
+                causal_masks = [full_mask] * len(layers)
         else:
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            causal = torch.ones(
-                seq_len, seq_len, dtype=torch.bool, device=device
-            ).tril()
+            seq_len = input_ids.shape[1]
+            causal = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device).tril()
             allowed = attention_mask[:, None, None, :].bool() & causal
-            causal_mask = (1.0 - allowed.to(hidden_states.dtype)) * torch.finfo(
+            full_mask = (1.0 - allowed.to(hidden_states.dtype)) * torch.finfo(
                 hidden_states.dtype
             ).min
+            causal_masks = [full_mask] * len(layers)
 
         rotary_embedding = getattr(root, "rotary_emb", None)
         position_embeddings = None
         if rotary_embedding is not None:
-            rotary_embedding.to(device)
-            position_embeddings = rotary_embedding(hidden_states, position_ids)
+            to_compute(rotary_embedding)
+            try:
+                position_embeddings = rotary_embedding(hidden_states, position_ids)
+            except IndexError:
+                # Multi-axis rotary (Qwen3.5) indexes one position row per
+                # spatial axis; the text tower feeds it identical text rows.
+                position_embeddings = rotary_embedding(
+                    hidden_states, position_ids[None, ...].expand(3, -1, -1)
+                )
 
         layer_states: list[Tensor] = []
 
-        kwargs: dict[str, Any] = {
-            "attention_mask": causal_mask,
-            "position_ids": position_ids,
-        }
+        kwargs: dict[str, Any] = {"position_ids": position_ids}
         if position_embeddings is not None:
             kwargs["position_embeddings"] = position_embeddings
 
-        for layer in layers:
+        # Each layer's resting device, so layers whose upload happened in the
+        # side-stream prefetch are still evicted after use. One layer ahead of
+        # execution, the next layer's weights are copied on a side stream while
+        # the GPU digests the current layer.
+        resting = {id(layer): next(layer.parameters()).device for layer in layers}
+        side = torch.cuda.Stream() if torch.cuda.is_available() else None
+        pending: torch.cuda.Event | None = None
+
+        for index, layer in enumerate(layers):
             # Mirrors Transformers' hidden-states collection: record the state entering
             # each layer, then finally the normed last-layer output. Only the activation
             # at the last prompt position is needed; keeping full sequences for all
             # layers would defeat the purpose of streaming.
             layer_states.append(hidden_states[:, -1, :].detach().cpu())
-            hidden_states = self._call_layer(layer, hidden_states, kwargs)
+            if pending is not None:
+                # Order the compute stream behind the side-stream upload enqueued in
+                # the previous iteration without stalling the CPU here.
+                torch.cuda.current_stream().wait_event(pending)
+                pending = None
+
+            layer_kwargs = dict(kwargs)
+            layer_kwargs["attention_mask"] = causal_masks[index]
+            hidden_states = self._call_layer(
+                layer, hidden_states, layer_kwargs, resting[id(layer)], device
+            )
+
+            next_layer = layers[index + 1] if index + 1 < len(layers) else None
+            if side is not None and next_layer is not None:
+                pending = self._prefetch_layer(next_layer, resting, device, side)
 
         if norm is not None:
             hidden_states = norm(hidden_states)
@@ -1131,17 +1304,32 @@ class Model:
 
         return layer_states, logits
 
+    def _prefetch_layer(
+        self, layer: Module, resting: dict[int, Any], device: torch.device, side: torch.cuda.Stream
+    ) -> torch.cuda.Event | None:
+        # Upload one layer on a side stream while the GPU digests the current
+        # one; the event orders the compute stream behind the copy. Hook-managed
+        # modules load themselves inside forward(), so skip those.
+        if resting[id(layer)] == device or getattr(layer, "_hf_hook", None) is not None:
+            return None
+        event = torch.cuda.Event()
+        with torch.cuda.stream(side):
+            layer.to(device)
+        event.record(side)
+        return event
+
     def _call_layer(
-        self, layer: Module, hidden_states: Tensor, kwargs: dict[str, Any]
+        self, layer: Module, hidden_states: Tensor, kwargs: dict[str, Any], origin: torch.device, compute: torch.device
     ) -> Tensor:
         # Load layer -> run everything queued through it -> unload: the layer is
         # moved onto the compute device when touched and evicted afterwards, so
         # peak VRAM stays around the largest layer plus activations instead of
         # the whole model. With a single-device load this is a no-op.
-        origin = next(layer.parameters()).device
-        compute = hidden_states.device
-        moved = origin != compute
-        if moved:
+        # accelerate's disk-offload hooks already load/unload around forward().
+        moved = origin != compute and getattr(layer, "_hf_hook", None) is None
+        # Layers uploaded by the previous iteration's prefetch only need the
+        # eviction in the finally block below.
+        if moved and next(layer.parameters()).device != compute:
             layer.to(compute)
         try:
             # (older decoder layers have no `position_embeddings` parameter and compute
@@ -1151,7 +1339,11 @@ class Model:
                 if reduced:
                     call_kwargs.pop("position_embeddings", None)
                 try:
-                    outputs = layer(hidden_states, use_cache=False, **call_kwargs)
+                    # No autograd graph: otherwise every layer's weight tensors stay
+                    # referenced by the graph hanging off the hidden-state chain, and
+                    # eviction after each layer frees nothing.
+                    with torch.no_grad():
+                        outputs = layer(hidden_states, use_cache=False, **call_kwargs)
                 except TypeError:
                     continue
                 return outputs[0] if isinstance(outputs, tuple) else outputs
@@ -1163,7 +1355,7 @@ class Model:
                 empty_cache()
 
     def _eager_forward_once(self, prompts: list[Prompt]) -> tuple[list[Tensor], Tensor]:
-        _, outputs = self.generate(
+        _, outputs = self._eager_generate(
             prompts,
             max_new_tokens=1,
             output_hidden_states=True,
@@ -1200,7 +1392,7 @@ class Model:
             chat_prompt,
             return_tensors="pt",
             return_token_type_ids=False,
-        ).to(self.model.device)
+        ).to(self.compute_device)
 
         streamer = TextStreamer(
             # The TextStreamer constructor annotates this parameter with the AutoTokenizer
