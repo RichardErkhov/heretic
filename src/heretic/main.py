@@ -443,10 +443,10 @@ def run():
 
             try:
                 # Warmup run to build the computation graph so that part isn't benchmarked.
-                model.get_responses(prompts)
+                model.get_logits(prompts)
 
                 start_time = time.perf_counter()
-                responses = model.get_responses(prompts)
+                model.get_logits(prompts)
                 end_time = time.perf_counter()
             except Exception as error:
                 if batch_size == 1:
@@ -462,12 +462,12 @@ def run():
 
                 break
 
-            response_lengths = [
-                len(model.tokenizer.encode(response)) for response in responses
-            ]
-            performance = sum(response_lengths) / (end_time - start_time)
+            # One forward pass over the batch is exactly what a decoding step and
+            # each scoring call cost with streamed weights, so it is the right unit
+            # for batch throughput; scoring itself only needs logits.
+            performance = len(prompts) / (end_time - start_time)
 
-            print(f"[green]Ok[/] ([bold]{performance:.0f}[/] tokens/s)")
+            print(f"[green]Ok[/] ([bold]{performance:.1f}[/] sequences/s)")
 
             if performance > best_performance:
                 best_batch_size = batch_size
