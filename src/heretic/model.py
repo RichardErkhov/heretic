@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, TypeAlias, cast
 
 import torch
+import tqdm
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch import FloatTensor, LongTensor, Tensor
 from torch.nn import Module, ModuleList
@@ -189,6 +190,13 @@ class Model:
                 settings.model,
                 **self.revision_kwargs,
             )
+
+        # With HF_HUB_OFFLINE set, from_pretrained records its transport flag in init_kwargs,
+        # and save_pretrained re-exports it in tokenizer_config.json; pin it so exports are
+        # byte-identical regardless of how the hub cache was populated.
+        for tokenizer in (self.tokenizer, getattr(self.processor, "tokenizer", None)):
+            if tokenizer is not None and "local_files_only" in tokenizer.init_kwargs:
+                tokenizer.init_kwargs["local_files_only"] = False
 
         # Fallback for tokenizers that don't declare a special pad token.
         if self.tokenizer.pad_token is None:
@@ -703,6 +711,16 @@ class Model:
             return torch.device("cpu")
         return cast(torch.device, embedding.weight.device)
 
+    def _round_batches(self, prompts: list[Prompt]) -> list[list[Prompt]]:
+        # Streamed runs feed the whole round into a single streamed pass: every
+        # layer's weights are then loaded once and reused by each chunk of the
+        # round, instead of repeating the disk read once per chunk
+        # (see _stream_forward_once). Eager runs keep plain batch-sized chunks.
+        if self.settings.stream_layers:
+            return [prompts]
+
+        return batchify(prompts, self.settings.batch_size)
+
     def generate(
         self,
         prompts: list[Prompt],
@@ -813,7 +831,7 @@ class Model:
     ) -> list[str]:
         responses = []
 
-        for batch in batchify(prompts, self.settings.batch_size):
+        for batch in self._round_batches(prompts):
             responses.extend(
                 self.get_responses(
                     batch,
@@ -862,7 +880,7 @@ class Model:
     ) -> Tensor:
         residuals = []
 
-        for batch in batchify(prompts, self.settings.batch_size):
+        for batch in self._round_batches(prompts):
             residuals.append(
                 self.get_residuals(
                     batch,
@@ -883,7 +901,7 @@ class Model:
         running_sum = None
         total_count = 0
 
-        for batch in batchify(prompts, self.settings.batch_size):
+        for batch in self._round_batches(prompts):
             batch_residuals = self.get_residuals(
                 batch,
                 winsorization_quantile=winsorization_quantile,
@@ -934,15 +952,20 @@ class Model:
                 if component not in module_io[layer_index]:
                     module_io[layer_index][component] = {}
 
-                # Each module should be invoked at most once per inference step.
-                assert module_index not in module_io[layer_index][component]
-
                 # inputs[0] and outputs have shape (prompt, position, component),
                 # so this extracts the input/output at the end of each prompt.
                 # Move to CPU to decouple from device assignments, which can
                 # change between model reloads in multi-GPU configurations.
                 input = inputs[0][:, -1, :].detach().clone().cpu()
                 output = outputs[:, -1, :].detach().clone().cpu()
+
+                # Streamed passes queue several chunks of prompts through each
+                # resident layer, so one module can be seen again within the same
+                # pass; append the new rows instead of replacing the captured ones.
+                if module_index in module_io[layer_index][component]:
+                    previous_input, previous_output = module_io[layer_index][component][module_index]
+                    input = torch.cat([previous_input, input], dim=0)
+                    output = torch.cat([previous_output, output], dim=0)
 
                 # The modules associated with a component (e.g. expert MLPs)
                 # are not necessarily invoked in order, nor are all of them
@@ -991,7 +1014,7 @@ class Model:
         # generic, this logic is required.
         module_io_batches: list[ModuleIO] = [
             self.get_module_io(batch)
-            for batch in batchify(prompts, self.settings.batch_size)
+            for batch in self._round_batches(prompts)
         ]
 
         module_io: ModuleIO = []
@@ -1077,7 +1100,7 @@ class Model:
     def get_logits_batched(self, prompts: list[Prompt]) -> Tensor:
         logits = []
 
-        for batch in batchify(prompts, self.settings.batch_size):
+        for batch in self._round_batches(prompts):
             logits.append(self.get_logits(batch))
 
         return torch.cat(logits, dim=0)
@@ -1150,7 +1173,28 @@ class Model:
                         f"* Streamed forward unavailable ({self.stream_fallback_reason}), falling back to eager forward."
                     )
 
-            return self._eager_forward_once(prompts)
+            # Rounds can hold more prompts than one eager batch; keep the
+            # fallback's memory profile at one batch at a time and stitch the
+            # per-batch results back together in prompt order.
+            batches = batchify(prompts, max(1, self.settings.batch_size))
+            if len(batches) <= 1:
+                return self._eager_forward_once(prompts)
+
+            batch_states: list[list[Tensor]] = []
+            batch_logits: list[Tensor] = []
+
+            for batch in batches:
+                states, logits = self._eager_forward_once(batch)
+                batch_states.append(states)
+                batch_logits.append(logits)
+
+            return (
+                [
+                    torch.cat([states[boundary] for states in batch_states], dim=0)
+                    for boundary in range(len(batch_states[0]))
+                ],
+                torch.cat(batch_logits, dim=0),
+            )
 
     def _stream_forward_once(
         self, prompts: list[Prompt], suffixes: list[str] | None = None
@@ -1164,13 +1208,6 @@ class Model:
                 prompt + suffix
                 for prompt, suffix in zip(chat_prompts, suffixes)
             ]
-
-        inputs = self.tokenizer(
-            chat_prompts,
-            padding=True,
-            return_tensors="pt",
-            return_token_type_ids=False,
-        )
 
         model = self.model
 
@@ -1209,74 +1246,100 @@ class Model:
         to_compute(lm_head)
         if norm is not None:
             to_compute(norm)
-        input_ids = inputs["input_ids"].to(device)
-        attention_mask = inputs["attention_mask"].to(device)
-
-        hidden_states = embedding(input_ids)
-
-        # Mirror the model's own forward pass exactly: Transformers 5 derives
-        # padding-aware position ids and attention masks via the helpers in
-        # `transformers.masking_utils`; older versions build the ids and the
-        # combined causal+padding mask by hand. Using anything else shifts
-        # every attention row and changes which token wins the argmax.
-        position_ids = attention_mask.long().cumsum(-1) - 1
-        position_ids.masked_fill_(attention_mask == 0, 0)
-        root_config = getattr(root, "config", model.config)
-        if create_causal_mask is not None:
-            mask_kwargs = {
-                "config": root_config,
-                "inputs_embeds": hidden_states,
-                "attention_mask": attention_mask,
-                "past_key_values": None,
-                "position_ids": position_ids,
-            }
-            full_mask = create_causal_mask(**mask_kwargs)
-            layer_types = list(getattr(root_config, "layer_types", None) or [])
-            hybrid = (
-                len(set(layer_types)) > 1
-                and len(layer_types) == len(layers)
-                and create_recurrent_attention_mask is not None
-            )
-            if hybrid:
-                # Hybrid stacks (e.g. Qwen3.5) mix full-attention and recurrent
-                # layers, and the text tower feeds each layer type its own mask.
-                recurrent_mask = create_recurrent_attention_mask(**mask_kwargs)
-                masks_by_type = {
-                    layer_type: recurrent_mask
-                    if layer_type == "linear_attention"
-                    else full_mask
-                    for layer_type in set(layer_types)
-                }
-                causal_masks = [masks_by_type[layer_type] for layer_type in layer_types]
-            else:
-                causal_masks = [full_mask] * len(layers)
-        else:
-            seq_len = input_ids.shape[1]
-            causal = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device).tril()
-            allowed = attention_mask[:, None, None, :].bool() & causal
-            full_mask = (1.0 - allowed.to(hidden_states.dtype)) * torch.finfo(
-                hidden_states.dtype
-            ).min
-            causal_masks = [full_mask] * len(layers)
 
         rotary_embedding = getattr(root, "rotary_emb", None)
-        position_embeddings = None
         if rotary_embedding is not None:
             to_compute(rotary_embedding)
-            try:
-                position_embeddings = rotary_embedding(hidden_states, position_ids)
-            except IndexError:
-                # Multi-axis rotary (Qwen3.5) indexes one position row per
-                # spatial axis; the text tower feeds it identical text rows.
-                position_embeddings = rotary_embedding(
-                    hidden_states, position_ids[None, ...].expand(3, -1, -1)
+
+        root_config = getattr(root, "config", model.config)
+
+        def prepare(chat_texts: list[str]) -> dict[str, Any]:
+            # Tokenize and embed one chunk. Each chunk keeps its own padding,
+            # masks and rotary states, so chunks can queue through every layer
+            # while that layer's weights are resident.
+            inputs = self.tokenizer(
+                chat_texts,
+                return_tensors="pt",
+                padding=True,
+                return_token_type_ids=False,
+            )
+            input_ids = inputs["input_ids"].to(device)
+            attention_mask = inputs["attention_mask"].to(device)
+            hidden_states = embedding(input_ids)
+
+            # Mirror the model's own forward pass exactly: Transformers 5 derives
+            # padding-aware position ids and attention masks via the helpers in
+            # `transformers.masking_utils`; older versions build the ids and the
+            # combined causal+padding mask by hand. Using anything else shifts
+            # every attention row and changes which token wins the argmax.
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 0)
+            if create_causal_mask is not None:
+                mask_kwargs = {
+                    "config": root_config,
+                    "inputs_embeds": hidden_states,
+                    "attention_mask": attention_mask,
+                    "past_key_values": None,
+                    "position_ids": position_ids,
+                }
+                full_mask = create_causal_mask(**mask_kwargs)
+                layer_types = list(getattr(root_config, "layer_types", None) or [])
+                hybrid = (
+                    len(set(layer_types)) > 1
+                    and len(layer_types) == len(layers)
+                    and create_recurrent_attention_mask is not None
                 )
+                if hybrid:
+                    # Hybrid stacks (e.g. Qwen3.5) mix full-attention and recurrent
+                    # layers, and the text tower feeds each layer type its own mask.
+                    recurrent_mask = create_recurrent_attention_mask(**mask_kwargs)
+                    masks_by_type = {
+                        layer_type: recurrent_mask
+                        if layer_type == "linear_attention"
+                        else full_mask
+                        for layer_type in set(layer_types)
+                    }
+                    causal_masks = [masks_by_type[layer_type] for layer_type in layer_types]
+                else:
+                    causal_masks = [full_mask] * len(layers)
+            else:
+                seq_len = input_ids.shape[1]
+                causal = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device).tril()
+                allowed = attention_mask[:, None, None, :].bool() & causal
+                full_mask = (1.0 - allowed.to(hidden_states.dtype)) * torch.finfo(
+                    hidden_states.dtype
+                ).min
+                causal_masks = [full_mask] * len(layers)
 
-        layer_states: list[Tensor] = []
+            position_embeddings = None
+            if rotary_embedding is not None:
+                try:
+                    position_embeddings = rotary_embedding(hidden_states, position_ids)
+                except IndexError:
+                    # Multi-axis rotary (Qwen3.5) indexes one position row per
+                    # spatial axis; the text tower feeds it identical text rows.
+                    position_embeddings = rotary_embedding(
+                        hidden_states, position_ids[None, ...].expand(3, -1, -1)
+                    )
 
-        kwargs: dict[str, Any] = {"position_ids": position_ids}
-        if position_embeddings is not None:
-            kwargs["position_embeddings"] = position_embeddings
+            kwargs: dict[str, Any] = {"position_ids": position_ids}
+            if position_embeddings is not None:
+                kwargs["position_embeddings"] = position_embeddings
+
+            return {
+                "hidden": hidden_states,
+                "kwargs": kwargs,
+                "causal_masks": causal_masks,
+                "rows": [],
+            }
+
+        # Layer-major pass: instead of running one full disk pass per batch-sized
+        # chunk, queue every chunk of the round through each layer while that
+        # layer's weights are resident, so the weights are read once per pass.
+        states = [
+            prepare(chunk)
+            for chunk in batchify(chat_prompts, max(1, self.settings.batch_size))
+        ]
 
         # Each layer's resting device, so layers whose upload happened in the
         # side-stream prefetch are still evicted after use. One layer ahead of
@@ -1286,36 +1349,51 @@ class Model:
         side = torch.cuda.Stream() if torch.cuda.is_available() else None
         pending: torch.cuda.Event | None = None
 
-        for index, layer in enumerate(layers):
-            # Mirrors Transformers' hidden-states collection: record the state entering
-            # each layer, then finally the normed last-layer output. Only the activation
-            # at the last prompt position is needed; keeping full sequences for all
-            # layers would defeat the purpose of streaming.
-            layer_states.append(hidden_states[:, -1, :].detach().cpu())
+        for index, layer in enumerate(tqdm.tqdm(layers, desc="Streaming layers")):
+            for state in states:
+                # Mirrors Transformers' hidden-states collection: record the state entering
+                # each layer, then finally the normed last-layer output. Only the activation
+                # at the last prompt position is needed; keeping full sequences for all
+                # layers would defeat the purpose of streaming.
+                state["rows"].append(state["hidden"][:, -1, :].detach().cpu())
+
             if pending is not None:
                 # Order the compute stream behind the side-stream upload enqueued in
                 # the previous iteration without stalling the CPU here.
                 torch.cuda.current_stream().wait_event(pending)
                 pending = None
 
-            layer_kwargs = dict(kwargs)
-            layer_kwargs["attention_mask"] = causal_masks[index]
-            hidden_states = self._call_layer(
-                layer, hidden_states, layer_kwargs, resting[id(layer)], device
+            items = [
+                (state["hidden"], {**state["kwargs"], "attention_mask": state["causal_masks"][index]})
+                for state in states
+            ]
+            hidden_states_list = self._call_layer(
+                layer, items, resting[id(layer)], device
             )
+            for state, hidden in zip(states, hidden_states_list):
+                state["hidden"] = hidden
 
             next_layer = layers[index + 1] if index + 1 < len(layers) else None
             if side is not None and next_layer is not None:
                 pending = self._prefetch_layer(next_layer, resting, device, side)
 
-        if norm is not None:
-            hidden_states = norm(hidden_states)
+        logits: list[Tensor] = []
 
-        layer_states.append(hidden_states[:, -1, :].detach().cpu())
+        for state in states:
+            hidden_states = state["hidden"]
 
-        logits = lm_head(hidden_states)[:, -1, :]
+            if norm is not None:
+                hidden_states = norm(hidden_states)
 
-        return layer_states, logits
+            state["rows"].append(hidden_states[:, -1, :].detach().cpu())
+            logits.append(lm_head(hidden_states)[:, -1, :])
+
+        layer_states = [
+            torch.cat([state["rows"][boundary] for state in states], dim=0)
+            for boundary in range(len(states[0]["rows"]))
+        ]
+
+        return layer_states, torch.cat(logits, dim=0)
 
     def _prefetch_layer(
         self, layer: Module, resting: dict[int, Any], device: torch.device, side: torch.cuda.Stream
@@ -1332,37 +1410,51 @@ class Model:
         return event
 
     def _call_layer(
-        self, layer: Module, hidden_states: Tensor, kwargs: dict[str, Any], origin: torch.device, compute: torch.device
-    ) -> Tensor:
-        # Load layer -> run everything queued through it -> unload: the layer is
-        # moved onto the compute device when touched and evicted afterwards, so
-        # peak VRAM stays around the largest layer plus activations instead of
-        # the whole model. With a single-device load this is a no-op.
-        # accelerate's disk-offload hooks already load/unload around forward().
-        moved = origin != compute and getattr(layer, "_hf_hook", None) is None
+        self, layer: Module, items: list[tuple[Tensor, dict[str, Any]]], origin: torch.device, compute: torch.device
+    ) -> list[Tensor]:
+        # Load layer -> run every queued chunk through it -> unload: the layer's
+        # weights stay resident for all chunks of the round, so each layer is
+        # read once per streamed pass instead of once per chunk. With a single
+        # device load this is a no-op. accelerate's disk-offload hooks load and
+        # unload around forward(); drive the hook once around the whole chunk
+        # queue and call the wrapped forward directly per chunk, so the hook's
+        # own unload does not fire between chunks of the same round.
+        hook = getattr(layer, "_hf_hook", None)
+        moved = origin != compute and hook is None
         # Layers uploaded by the previous iteration's prefetch only need the
         # eviction in the finally block below.
         if moved and next(layer.parameters()).device != compute:
             layer.to(compute)
+        forward = getattr(layer, "_old_forward", None) if hook is not None else None
+        outputs: list[Tensor] = []
         try:
-            # (older decoder layers have no `position_embeddings` parameter and compute
-            # rotary embeddings themselves), so retry with a reduced set on TypeError.
-            for reduced in (False, True):
-                call_kwargs = dict(kwargs)
-                if reduced:
-                    call_kwargs.pop("position_embeddings", None)
-                try:
-                    # No autograd graph: otherwise every layer's weight tensors stay
-                    # referenced by the graph hanging off the hidden-state chain, and
-                    # eviction after each layer frees nothing.
-                    with torch.no_grad():
-                        outputs = layer(hidden_states, use_cache=False, **call_kwargs)
-                except TypeError:
-                    continue
-                return outputs[0] if isinstance(outputs, tuple) else outputs
+            if hook is not None:
+                hook.pre_forward(layer)
 
-            raise TypeError("Decoder layer rejected both full and reduced keyword sets.")
+            for hidden_states, call_kwargs in items:
+                # (older decoder layers have no `position_embeddings` parameter and compute
+                # rotary embeddings themselves), so retry with a reduced set on TypeError.
+                for reduced in (False, True):
+                    kwargs = dict(call_kwargs)
+                    if reduced:
+                        kwargs.pop("position_embeddings", None)
+                    try:
+                        # No autograd graph: otherwise every layer's weight tensors stay
+                        # referenced by the graph hanging off the hidden-state chain, and
+                        # eviction after each layer frees nothing.
+                        with torch.no_grad():
+                            out = (forward if forward is not None else layer)(hidden_states, use_cache=False, **kwargs)
+                    except TypeError:
+                        continue
+                    outputs.append(out[0] if isinstance(out, tuple) else out)
+                    break
+                else:
+                    raise TypeError("Decoder layer rejected both full and reduced keyword sets.")
+
+            return outputs
         finally:
+            if hook is not None:
+                hook.post_forward(layer, outputs[-1] if outputs else None)
             if moved:
                 layer.to(origin)
                 empty_cache()

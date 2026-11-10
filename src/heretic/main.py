@@ -434,6 +434,10 @@ def run():
                 batch_size / len(batch_size_test_prompts)
             )
             prompts = prompts[:batch_size]
+            # Trials must chunk at the size being measured; settings.batch_size
+            # is still 0 until tuning finishes, which would make every streamed
+            # trial run its rows through each layer one at a time.
+            settings.batch_size = batch_size
 
             try:
                 # Warmup run to build the computation graph so that part isn't benchmarked.
@@ -463,48 +467,58 @@ def run():
             print(f"[green]Ok[/] ([bold]{performance:.1f}[/] sequences/s)")
             return performance
 
-        batch_size = 1
+        def estimate_batch_size() -> int:
+            # Guess capacity instead of probing from 1 upward: bs=1 and bs=2 passes
+            # measure the activation cost per sequence, then scale how many
+            # sequences fit below the observed peak. The refine loop below corrects
+            # the guess in either direction.
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            if try_batch_size(1) is None:
+                return 1
+            if not torch.cuda.is_available():
+                # No VRAM statistics to scale from; start reasonably large.
+                return min(32, settings.max_batch_size)
+            peak_1 = torch.cuda.max_memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            if try_batch_size(2) is None:
+                return 1
+            peak_2 = torch.cuda.max_memory_allocated()
+            per_sequence = max(peak_2 - peak_1, 1)
+            headroom = torch.cuda.mem_get_info()[1] - peak_2
+            return max(2, min(2 + int(headroom / per_sequence), settings.max_batch_size))
+
         best_batch_size = -1
         best_performance = -1
 
-        while batch_size <= settings.max_batch_size:
+        batch_size = estimate_batch_size()
+
+        while best_performance < 0:
             print(f"* Trying batch size [bold]{batch_size}[/]... ", end="")
 
             performance = try_batch_size(batch_size)
 
             if performance is None:
-                break
+                batch_size = max(1, batch_size // 2)
+                continue
 
-            if performance > best_performance:
-                best_batch_size = batch_size
-                best_performance = performance
-
-            batch_size *= 2
+            best_batch_size = batch_size
+            best_performance = performance
 
         # Throughput keeps rising with larger batches until memory fills up, because
         # each forward pass pays the weight-loading cost once for the whole batch
         # (and processing a round's prompts in a single pass avoids re-loading the
-        # weights per chunk). Binary search the gap between the largest working
-        # power of two and the first failing size to use memory as fully as possible.
-        lower = best_batch_size
-        upper = min(batch_size - 1, settings.max_batch_size)
+        # weights per chunk). If the estimate left headroom, take the doubled batch
+        # when it still fits and runs faster.
+        doubled = min(batch_size * 2, settings.max_batch_size)
+        if doubled > batch_size:
+            print(f"* Trying batch size [bold]{doubled}[/]... ", end="")
 
-        while lower < upper:
-            middle = (lower + upper + 1) // 2
+            performance = try_batch_size(doubled)
 
-            print(f"* Trying batch size [bold]{middle}[/]... ", end="")
-
-            performance = try_batch_size(middle)
-
-            if performance is None:
-                upper = middle - 1
-                continue
-
-            if performance > best_performance:
-                best_batch_size = middle
+            if performance is not None and performance > best_performance:
+                best_batch_size = doubled
                 best_performance = performance
-
-            lower = middle
 
         settings.batch_size = best_batch_size
         print(f"* Chosen batch size: [bold]{settings.batch_size}[/]")
