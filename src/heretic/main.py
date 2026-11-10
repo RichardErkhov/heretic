@@ -628,7 +628,12 @@ def run():
         if settings.response_prefix is None:
             print()
             print("Checking for common response prefix...")
-            responses = model.get_responses_batched(response_prefix_test_prompts)
+            # shortcut: shared response prefixes are short by construction; the cap
+            # keeps streamed decode to few weight-loading passes. Raise it if a real
+            # prefix ever gets truncated.
+            responses = model.get_responses_batched(
+                response_prefix_test_prompts, max_new_tokens=32
+            )
 
             # Despite being located in os.path, commonprefix actually performs
             # a naive string operation without any path-specific logic,
@@ -667,7 +672,9 @@ def run():
             # When using a Chain-of-Thought skip, we need to check that the prefix
             # is actually complete (e.g. not missing a trailing newline).
             print("* Rechecking with prefix...")
-            responses = model.get_responses_batched(response_prefix_test_prompts)
+            responses = model.get_responses_batched(
+                response_prefix_test_prompts, max_new_tokens=32
+            )
             additional_prefix = commonprefix(responses).rstrip(" ")
             if additional_prefix:
                 settings.response_prefix += additional_prefix

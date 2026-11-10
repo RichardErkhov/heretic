@@ -810,10 +810,15 @@ class Model:
         self,
         prompts: list[Prompt],
         skip_special_tokens: bool = False,
+        max_new_tokens: int | None = None,
     ) -> list[str]:
         inputs, outputs = self.generate(
             prompts,
-            max_new_tokens=self.settings.max_response_length,
+            max_new_tokens=(
+                max_new_tokens
+                if max_new_tokens is not None
+                else self.settings.max_response_length
+            ),
         )
 
         return self.tokenizer.batch_decode(
@@ -828,6 +833,7 @@ class Model:
         self,
         prompts: list[Prompt],
         skip_special_tokens: bool = False,
+        max_new_tokens: int | None = None,
     ) -> list[str]:
         responses = []
 
@@ -836,6 +842,7 @@ class Model:
                 self.get_responses(
                     batch,
                     skip_special_tokens=skip_special_tokens,
+                    max_new_tokens=max_new_tokens,
                 )
             )
 
