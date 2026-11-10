@@ -429,13 +429,7 @@ def run():
         print()
         print("Determining optimal batch size...")
 
-        batch_size = 1
-        best_batch_size = -1
-        best_performance = -1
-
-        while batch_size <= settings.max_batch_size:
-            print(f"* Trying batch size [bold]{batch_size}[/]... ", end="")
-
+        def try_batch_size(batch_size: int) -> float | None:
             prompts = batch_size_test_prompts * math.ceil(
                 batch_size / len(batch_size_test_prompts)
             )
@@ -459,8 +453,7 @@ def run():
                     print(f"[red]Failed:\n{formatted}[/]")
                 else:
                     print(f"[red]Failed ({formatted})[/]")
-
-                break
+                return None
 
             # One forward pass over the batch is exactly what a decoding step and
             # each scoring call cost with streamed weights, so it is the right unit
@@ -468,12 +461,50 @@ def run():
             performance = len(prompts) / (end_time - start_time)
 
             print(f"[green]Ok[/] ([bold]{performance:.1f}[/] sequences/s)")
+            return performance
+
+        batch_size = 1
+        best_batch_size = -1
+        best_performance = -1
+
+        while batch_size <= settings.max_batch_size:
+            print(f"* Trying batch size [bold]{batch_size}[/]... ", end="")
+
+            performance = try_batch_size(batch_size)
+
+            if performance is None:
+                break
 
             if performance > best_performance:
                 best_batch_size = batch_size
                 best_performance = performance
 
             batch_size *= 2
+
+        # Throughput keeps rising with larger batches until memory fills up, because
+        # each forward pass pays the weight-loading cost once for the whole batch
+        # (and processing a round's prompts in a single pass avoids re-loading the
+        # weights per chunk). Binary search the gap between the largest working
+        # power of two and the first failing size to use memory as fully as possible.
+        lower = best_batch_size
+        upper = min(batch_size - 1, settings.max_batch_size)
+
+        while lower < upper:
+            middle = (lower + upper + 1) // 2
+
+            print(f"* Trying batch size [bold]{middle}[/]... ", end="")
+
+            performance = try_batch_size(middle)
+
+            if performance is None:
+                upper = middle - 1
+                continue
+
+            if performance > best_performance:
+                best_batch_size = middle
+                best_performance = performance
+
+            lower = middle
 
         settings.batch_size = best_batch_size
         print(f"* Chosen batch size: [bold]{settings.batch_size}[/]")

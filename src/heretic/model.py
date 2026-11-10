@@ -368,9 +368,22 @@ class Model:
         self._zero_lora_weights()
 
     def _zero_lora_weights(self):
+        device = self.compute_device
         for name, module in self.model.named_modules():
             if ("lora_A" in name or "lora_B" in name) and hasattr(module, "weight"):
-                torch.nn.init.zeros_(module.weight)
+                if module.weight.is_meta:
+                    # PEFT creates the adapter weights while dispatched base
+                    # weights are meta placeholders, so they land on meta too;
+                    # rebuild them as real tensors the optimizer can update.
+                    module.weight = torch.nn.Parameter(
+                        torch.zeros(
+                            module.weight.shape,
+                            dtype=module.weight.dtype,
+                            device=device,
+                        )
+                    )
+                else:
+                    torch.nn.init.zeros_(module.weight)
 
     def _get_quantization_config(self, dtype: str) -> BitsAndBytesConfig | None:
         """

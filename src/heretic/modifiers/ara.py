@@ -268,8 +268,16 @@ class ARA(Modifier[Parameters]):
                     # Cast to Linear to access weights and LoRA adapters.
                     module = cast(Linear, module)
 
+                    # accelerate's disk-offload parks unloaded weights on the meta
+                    # device; the module's hook materializes them only between
+                    # pre_forward and post_forward, so read the weight inside that window.
+                    base_layer = module.base_layer
+                    hook = getattr(base_layer, "_hf_hook", None)
+                    if hook is not None:
+                        hook.pre_forward(base_layer)
+
                     # We need the base weight in float32 to compute the effective weight.
-                    base_weight = cast(Tensor, module.base_layer.weight)
+                    base_weight = cast(Tensor, base_layer.weight)
                     quant_state = getattr(base_weight, "quant_state", None)
 
                     if quant_state is None:
@@ -327,9 +335,12 @@ class ARA(Modifier[Parameters]):
                     # ARA only modifies the weight. If the module has a bias, the
                     # captured output includes it, so add it back to the modified output
                     # (after row normalization, which must not rescale the bias).
-                    bias = cast(Tensor | None, module.base_layer.bias)
+                    bias = cast(Tensor | None, base_layer.bias)
                     if bias is not None:
                         bias = bias.detach().float().to(lora_A.device)
+
+                    if hook is not None:
+                        hook.post_forward(base_layer, None)
 
                     def objective(A: Tensor, B: Tensor) -> Tensor:
                         # input @ (W_base + B @ A).T
