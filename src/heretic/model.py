@@ -151,6 +151,11 @@ def chat_template_supports_system_role(tokenizer: PreTrainedTokenizerBase) -> bo
 ModuleIO: TypeAlias = list[dict[str, dict[int, tuple[Tensor, Tensor]]]]
 
 
+def _cuda_usable() -> bool:
+    # CUDA_VISIBLE_DEVICES="" keeps is_available() True with zero visible devices on some builds; gate on the count so device work falls back to CPU instead of failing with "Invalid device id".
+    return torch.cuda.is_available() and torch.cuda.device_count() > 0
+
+
 class Model:
     model: PreTrainedModel | PeftModel
     tokenizer: PreTrainedTokenizerBase
@@ -165,6 +170,7 @@ class Model:
         self.settings = settings
         self.needs_reload = False
         self.stream_fallback_reason: str | None = None
+        self.passes_bar: tqdm.tqdm | None = None
 
         self.revision_kwargs = {}
         if settings.model_commit is not None:
@@ -221,7 +227,7 @@ class Model:
                 # without it every layer past the RAM bucket just stays in CPU
                 # RAM. With the disk bucket, each layer is read back from disk
                 # when touched, so peak RAM is about one layer, not the model.
-                else ({"cpu": "2GB", **({0: "6GB"} if torch.cuda.is_available() else {}),
+                else ({"cpu": "2GB", **({0: "6GB"} if _cuda_usable() else {}),
                        "disk": float("inf")} if settings.stream_layers else None)
         )
 
@@ -705,7 +711,7 @@ class Model:
         # stale value for multi-tower checkpoints. A disk-offloaded embedding
         # rests on the meta device, so fall back to where activations run.
         embedding = self.model.get_input_embeddings()
-        if torch.cuda.is_available():
+        if _cuda_usable():
             return torch.device("cuda")
         if embedding.weight.is_meta:
             return torch.device("cpu")
@@ -729,7 +735,9 @@ class Model:
         if self.settings.stream_layers:
             return self._generate_streamed(prompts, **kwargs)
 
-        return self._eager_generate(prompts, **kwargs)
+        result = self._eager_generate(prompts, **kwargs)
+        self._finish_pass()
+        return result
 
     def _eager_generate(
         self,
@@ -767,6 +775,7 @@ class Model:
         # are capped at a few dozen tokens, keeping the recompute cheap; the
         # decoded pieces are concatenated as text and re-tokenized together.
         max_new_tokens = int(kwargs.get("max_new_tokens", 20))
+        self._begin_passes(max_new_tokens)
 
         chat_prompts = self._render_chat_prompts(prompts)
         continuations = [""] * len(chat_prompts)
@@ -1105,9 +1114,11 @@ class Model:
         return logits
 
     def get_logits_batched(self, prompts: list[Prompt]) -> Tensor:
+        rounds = self._round_batches(prompts)
+        self._begin_passes(len(rounds))
         logits = []
 
-        for batch in self._round_batches(prompts):
+        for batch in rounds:
             logits.append(self.get_logits(batch))
 
         return torch.cat(logits, dim=0)
@@ -1159,6 +1170,28 @@ class Model:
 
         return residuals
 
+    def _progress_bar(self) -> tqdm.tqdm:
+        # Outer bar: counts complete streamed layer sweeps ("loops"). The inner
+        # "Streaming layers" bar is disappearable (leave=False); this one stays
+        # and shows how many loops ran out of how many the current phase plans.
+        if self.passes_bar is None:
+            self.passes_bar = tqdm.tqdm(desc=self._passes_desc())
+        return self.passes_bar
+
+    def _passes_desc(self) -> str:
+        return f"Streaming passes (batch size {self.settings.batch_size})"
+
+    def _begin_passes(self, total: int) -> None:
+        # Phases with a known round count announce it here; others leave the
+        # bar count-only. Batch-size tuning reuses the bar across trials,
+        # so refresh the desc to the size actually in effect.
+        bar = self._progress_bar()
+        bar.set_description_str(self._passes_desc())
+        bar.reset(total=total)
+
+    def _finish_pass(self) -> None:
+        self._progress_bar().update(1)
+
     def _stream_forward(
         self, prompts: list[Prompt], suffixes: list[str] | None = None
     ) -> tuple[list[Tensor], Tensor]:
@@ -1173,7 +1206,9 @@ class Model:
         with torch.no_grad():
             if self.stream_fallback_reason is None:
                 try:
-                    return self._stream_forward_once(prompts, suffixes)
+                    result = self._stream_forward_once(prompts, suffixes)
+                    self._finish_pass()
+                    return result
                 except Exception as error:
                     self.stream_fallback_reason = format_exception(error)
                     print(
@@ -1185,13 +1220,16 @@ class Model:
             # per-batch results back together in prompt order.
             batches = batchify(prompts, max(1, self.settings.batch_size))
             if len(batches) <= 1:
-                return self._eager_forward_once(prompts)
+                states, logits = self._eager_forward_once(prompts)
+                self._finish_pass()
+                return states, logits
 
             batch_states: list[list[Tensor]] = []
             batch_logits: list[Tensor] = []
 
             for batch in batches:
                 states, logits = self._eager_forward_once(batch)
+                self._finish_pass()
                 batch_states.append(states)
                 batch_logits.append(logits)
 
@@ -1353,16 +1391,18 @@ class Model:
         # execution, the next layer's weights are copied on a side stream while
         # the GPU digests the current layer.
         resting = {id(layer): next(layer.parameters()).device for layer in layers}
-        side = torch.cuda.Stream() if torch.cuda.is_available() else None
+        side = torch.cuda.Stream() if _cuda_usable() else None
         pending: torch.cuda.Event | None = None
 
-        for index, layer in enumerate(tqdm.tqdm(layers, desc="Streaming layers")):
+        for index, layer in enumerate(tqdm.tqdm(layers, desc="Streaming layers", leave=False)):
             for state in states:
                 # Mirrors Transformers' hidden-states collection: record the state entering
                 # each layer, then finally the normed last-layer output. Only the activation
-                # at the last prompt position is needed; keeping full sequences for all
-                # layers would defeat the purpose of streaming.
-                state["rows"].append(state["hidden"][:, -1, :].detach().cpu())
+                # at the last prompt position is needed; cloning (not viewing) that slice
+                # releases the full sequence right away. The slices stay on the compute
+                # device until the sweep ends, which avoids one blocking device sync per
+                # layer; their combined size is tiny next to the layer weights.
+                state["rows"].append(state["hidden"][:, -1, :].detach().clone())
 
             if pending is not None:
                 # Order the compute stream behind the side-stream upload enqueued in
@@ -1387,13 +1427,17 @@ class Model:
         logits: list[Tensor] = []
 
         for state in states:
-            hidden_states = state["hidden"]
+            # Both consumers (recorded rows, first-token logits) only use the last
+            # position: slice before norm/lm_head so the lm_head intermediate is one
+            # row per sequence instead of the full padded sequence (same rows out).
+            hidden_states = state["hidden"][:, -1, :].detach().clone()
 
             if norm is not None:
                 hidden_states = norm(hidden_states)
 
-            state["rows"].append(hidden_states[:, -1, :].detach().cpu())
-            logits.append(lm_head(hidden_states)[:, -1, :])
+            state["hidden"] = hidden_states
+            state["rows"].append(hidden_states)
+            logits.append(lm_head(hidden_states))
 
         layer_states = [
             torch.cat([state["rows"][boundary] for state in states], dim=0)
@@ -1407,8 +1451,17 @@ class Model:
     ) -> torch.cuda.Event | None:
         # Upload one layer on a side stream while the GPU digests the current
         # one; the event orders the compute stream behind the copy. Hook-managed
-        # modules load themselves inside forward(), so skip those.
-        if resting[id(layer)] == device or getattr(layer, "_hf_hook", None) is not None:
+        # layers load onto the compute device through their own pre_forward, so
+        # call that early here instead: the weights stay resident and the
+        # layer's own window skips the redundant reload (see _call_layer).
+        # Peak stays ~two largest layers + activations. The copy is ordered
+        # behind the current compute on the compute stream, so no event needed.
+        hook = getattr(layer, "_hf_hook", None)
+        if hook is not None:
+            if next(layer.parameters()).device != device:
+                hook.pre_forward(layer)
+            return None
+        if resting[id(layer)] == device:
             return None
         event = torch.cuda.Event()
         with torch.cuda.stream(side):
@@ -1435,7 +1488,8 @@ class Model:
         forward = getattr(layer, "_old_forward", None) if hook is not None else None
         outputs: list[Tensor] = []
         try:
-            if hook is not None:
+            if hook is not None and next(layer.parameters()).device != compute:
+                # Already uploaded by the previous window's prefetch.
                 hook.pre_forward(layer)
 
             for hidden_states, call_kwargs in items:
