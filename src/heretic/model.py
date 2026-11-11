@@ -9,6 +9,7 @@ from typing import Any, TypeAlias, cast
 
 import torch
 import tqdm
+from accelerate.utils import named_module_tensors, set_module_tensor_to_device
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch import FloatTensor, LongTensor, Tensor
 from torch.nn import Module, ModuleList
@@ -1387,9 +1388,11 @@ class Model:
         ]
 
         # Each layer's resting device, so layers whose upload happened in the
-        # side-stream prefetch are still evicted after use. One layer ahead of
-        # execution, the next layer's weights are copied on a side stream while
-        # the GPU digests the current layer.
+        # prefetch are still evicted after use. Prefetch window: three layers
+        # ahead. The next layer is fully loaded onto the compute device while
+        # this layer's chunks drain (side-stream copy on GPU boxes); the two
+        # behind it only get their bucket bytes read RAM-side, so their later
+        # hop starts warm. On CPU-only boxes both stages are the same hop.
         resting = {id(layer): next(layer.parameters()).device for layer in layers}
         side = torch.cuda.Stream() if _cuda_usable() else None
         pending: torch.cuda.Event | None = None
@@ -1420,9 +1423,11 @@ class Model:
             for state, hidden in zip(states, hidden_states_list):
                 state["hidden"] = hidden
 
-            next_layer = layers[index + 1] if index + 1 < len(layers) else None
-            if side is not None and next_layer is not None:
-                pending = self._prefetch_layer(next_layer, resting, device, side)
+            ahead = layers[index + 1 : index + 4]
+            if ahead:
+                pending = self._prefetch_layer(ahead[0], resting, device, side)
+                for lookahead in ahead[1:]:
+                    self._warm_layer(lookahead)
 
         logits: list[Tensor] = []
 
@@ -1447,7 +1452,7 @@ class Model:
         return layer_states, torch.cat(logits, dim=0)
 
     def _prefetch_layer(
-        self, layer: Module, resting: dict[int, Any], device: torch.device, side: torch.cuda.Stream
+        self, layer: Module, resting: dict[int, Any], device: torch.device, side: torch.cuda.Stream | None
     ) -> torch.cuda.Event | None:
         # Upload one layer on a side stream while the GPU digests the current
         # one; the event orders the compute stream behind the copy. Hook-managed
@@ -1459,13 +1464,68 @@ class Model:
         hook = getattr(layer, "_hf_hook", None)
         if hook is not None:
             if next(layer.parameters()).device != device:
-                hook.pre_forward(layer)
+                return self._upload_layer(layer, hook, device, side)
             return None
-        if resting[id(layer)] == device:
+        if side is None or resting[id(layer)] == device:
             return None
         event = torch.cuda.Event()
         with torch.cuda.stream(side):
             layer.to(device)
+        event.record(side)
+        return event
+
+    def _warm_layer(self, layer: Module) -> None:
+        # Two stages behind the full prefetch: read the layer's offloaded
+        # weights through the hook's own loader so the later real load hits a
+        # warm cache instead of the disk, then drop the values. Weights without
+        # a hook already rest in RAM. Tensors are released per weight, so peak
+        # stays one weight above the prefetch window.
+        hook = getattr(layer, "_hf_hook", None)
+        if hook is None or next(layer.parameters()).device != self.compute_device:
+            return
+        for name, _ in named_module_tensors(
+            layer, include_buffers=hook.offload_buffers, recurse=hook.place_submodules, remove_non_persistent=True
+        ):
+            hook.weights_map[name]
+
+    def _upload_layer(
+        self, layer: Module, hook: Any, device: torch.device, side: torch.cuda.Stream | None
+    ) -> torch.cuda.Event | None:
+        # Mirror of the hook's own weight-load loop with pinned staging: pageable
+        # host->device copies crawl on this box, so with CUDA each weight is copied
+        # into a pinned buffer first and the hop is enqueued asynchronously on the
+        # side stream. Same source values and dtype casts as hook.pre_forward, so
+        # the numbers are bit-for-bit unchanged. The loop skips the hook's tied-
+        # pointer dedup: shared tensors inside one layer get one identical copy per
+        # name instead of one shared copy. shortcut: if a checkpoint ties huge
+        # tensors within a layer, route dedup through hook.tied_params_map like
+        # pre_forward does.
+        hook.tied_pointers_to_remove = set()
+        event = torch.cuda.Event() if side is not None else None
+        with torch.cuda.stream(side) if side is not None else suppress():
+            for name, _ in named_module_tensors(
+                layer,
+                include_buffers=hook.offload_buffers,
+                recurse=hook.place_submodules,
+                remove_non_persistent=True,
+            ):
+                value = hook.weights_map[name]
+                if side is not None:
+                    staged = torch.empty(tuple(value.shape), dtype=value.dtype, pin_memory=True)
+                    staged.copy_(value)
+                    value = staged
+                set_module_tensor_to_device(
+                    layer,
+                    name,
+                    device,
+                    value=value,
+                    fp16_statistics=hook._maybe_get_fp16_statistics(name, value),
+                    tied_params_map=hook.tied_params_map,
+                    non_blocking=side is not None,
+                    clear_cache=False,
+                )
+        if event is None:
+            return None
         event.record(side)
         return event
 
