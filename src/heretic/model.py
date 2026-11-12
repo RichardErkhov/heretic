@@ -169,12 +169,12 @@ class Model:
     dtype: torch.dtype
     # Whether the model's chat template accepts a system role (see __init__).
     supports_system_role: bool
+    passes_bar: tqdm.tqdm | None = None
 
     def __init__(self, settings: Settings):
         self.settings = settings
         self.needs_reload = False
         self.stream_fallback_reason: str | None = None
-        self.passes_bar: tqdm.tqdm | None = None
 
         self.revision_kwargs = {}
         if settings.model_commit is not None:
