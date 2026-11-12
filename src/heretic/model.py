@@ -156,6 +156,9 @@ def _cuda_usable() -> bool:
     # CUDA_VISIBLE_DEVICES="" keeps is_available() True with zero visible devices on some builds; gate on the count so device work falls back to CPU instead of failing with "Invalid device id".
     return torch.cuda.is_available() and torch.cuda.device_count() > 0
 
+# Pinned staging buffers reused per weight shape; fills and hops stay ordered on the single upload stream, so a buffer is never overwritten while its previous hop is in flight.
+_STAGING: dict[tuple[Any, Any], Tensor] = {}
+
 
 class Model:
     model: PreTrainedModel | PeftModel
@@ -1511,7 +1514,11 @@ class Model:
             ):
                 value = hook.weights_map[name]
                 if side is not None:
-                    staged = torch.empty(tuple(value.shape), dtype=value.dtype, pin_memory=True)
+                    key = (tuple(value.shape), value.dtype)
+                    staged = _STAGING.get(key)
+                    if staged is None:
+                        staged = torch.empty(key[0], dtype=key[1], pin_memory=True)
+                        _STAGING[key] = staged
                     staged.copy_(value)
                     value = staged
                 set_module_tensor_to_device(
