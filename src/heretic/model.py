@@ -1432,27 +1432,25 @@ class Model:
                 for lookahead in ahead[1:]:
                     self._warm_layer(lookahead)
 
-        logits: list[Tensor] = []
+        # Both consumers (recorded rows, first-token logits) only use the last position: slice before norm/lm_head so the lm_head intermediate is one row per sequence instead of the full padded sequence (same rows out). Concatenating first makes norm and head read their weight matrices once per round instead of once per chunk; RMSNorm is row-wise, so the values are unchanged.
+        last_rows = torch.cat([state["hidden"][:, -1, :].detach() for state in states])
 
+        if norm is not None:
+            last_rows = norm(last_rows)
+
+        offset = 0
         for state in states:
-            # Both consumers (recorded rows, first-token logits) only use the last
-            # position: slice before norm/lm_head so the lm_head intermediate is one
-            # row per sequence instead of the full padded sequence (same rows out).
-            hidden_states = state["hidden"][:, -1, :].detach().clone()
-
-            if norm is not None:
-                hidden_states = norm(hidden_states)
-
-            state["hidden"] = hidden_states
-            state["rows"].append(hidden_states)
-            logits.append(lm_head(hidden_states))
+            count = state["hidden"].shape[0]
+            state["hidden"] = last_rows[offset : offset + count]
+            state["rows"].append(state["hidden"])
+            offset += count
 
         layer_states = [
             torch.cat([state["rows"][boundary] for state in states], dim=0)
             for boundary in range(len(states[0]["rows"]))
         ]
 
-        return layer_states, torch.cat(logits, dim=0)
+        return layer_states, lm_head(last_rows)
 
     def _prefetch_layer(
         self, layer: Module, resting: dict[int, Any], device: torch.device, side: torch.cuda.Stream | None
