@@ -1464,7 +1464,10 @@ class Model:
         # behind the current compute on the compute stream, so no event needed.
         hook = getattr(layer, "_hf_hook", None)
         if hook is not None:
-            if next(layer.parameters()).device != device:
+            # Accelerate fills a lazy offload map on the layer's first pre_forward;
+            # until then the module holds meta placeholders, so only the eager
+            # hook path can touch it. Skip ahead-of-time work for those layers.
+            if hook.weights_map is not None and next(layer.parameters()).device != device:
                 return self._upload_layer(layer, hook, device, side)
             return None
         if side is None or resting[id(layer)] == device:
@@ -1482,7 +1485,7 @@ class Model:
         # a hook already rest in RAM. Tensors are released per weight, so peak
         # stays one weight above the prefetch window.
         hook = getattr(layer, "_hf_hook", None)
-        if hook is None or next(layer.parameters()).device != self.compute_device:
+        if hook is None or hook.weights_map is None or next(layer.parameters()).device != self.compute_device:
             return
         for name, _ in named_module_tensors(
             layer, include_buffers=hook.offload_buffers, recurse=hook.place_submodules, remove_non_persistent=True
