@@ -1419,8 +1419,8 @@ class Model:
         if entry is not None and entry[0] <= boundary:
             start, hiddens, row_sets = entry
             for state, hidden, rows in zip(states, hiddens, row_sets):
-                state["hidden"] = hidden
-                state["rows"] = list(rows)
+                state["hidden"] = hidden.to(device)
+                state["rows"] = [row.to(device) for row in rows]
 
         for index, layer in enumerate(tqdm.tqdm(layers[start:], desc="Streaming layers", leave=False), start):
             for state in states:
@@ -1455,15 +1455,16 @@ class Model:
                     self._warm_layer(lookahead)
 
             # Snapshot for the next identical prompt batch: hidden entering the
-            # boundary layer plus the rows recorded so far. shortcut: fixed FIFO
-            # of 8 batches; raise the cap if studies use many distinct eval sets.
+            # boundary layer plus the rows recorded so far, parked in host RAM so
+            # VRAM stays at the streamed level. shortcut: fixed FIFO of 8 batches;
+            # raise the cap if studies use many distinct eval sets.
             if index == boundary - 1:
                 if len(self._prefix_cache) >= 8:
                     self._prefix_cache.pop(next(iter(self._prefix_cache)))
                 self._prefix_cache[key] = (
                     index + 1,
-                    [state["hidden"] for state in states],
-                    [list(state["rows"]) for state in states],
+                    [state["hidden"].cpu() for state in states],
+                    [[r.cpu() for r in state["rows"]] for state in states],
                 )
 
         # Both consumers (recorded rows, first-token logits) only use the last position: slice before norm/lm_head so the lm_head intermediate is one row per sequence instead of the full padded sequence (same rows out). Concatenating first makes norm and head read their weight matrices once per round instead of once per chunk; RMSNorm is row-wise, so the values are unchanged.
