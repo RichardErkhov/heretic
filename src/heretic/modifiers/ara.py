@@ -253,6 +253,7 @@ class ARA(Modifier[Parameters]):
 
     def modify_model(self, ctx: Context, parameters: Parameters) -> None:
         model = ctx.get_model()
+        model.prefix_boundary = parameters.start_layer_index
 
         # The model's reset zeroes both A and B, where all gradients vanish,
         # so A must be initialized below for the optimization to make progress.

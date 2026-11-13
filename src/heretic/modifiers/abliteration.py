@@ -309,6 +309,12 @@ class Abliteration(Modifier[Parameters]):
 
     def modify_model(self, ctx: Context, parameters: Parameters) -> None:
         model = ctx.get_model()
+        # Earliest layer any component still touches: a component skips layers
+        # farther than min_weight_distance from max_weight_position.
+        model.prefix_boundary = min(
+            max(0, math.ceil(wd.max_weight_position - wd.min_weight_distance))
+            for wd in parameters.weight_distributions.values()
+        )
 
         if parameters.direction_index is None:
             residual_direction = None

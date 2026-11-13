@@ -250,6 +250,11 @@ class Model:
             ctypes.WinDLL("psapi").EmptyWorkingSet(handle)
 
         self.trusted_models = set()
+        # Layers [0, prefix_boundary) keep their base weights across trials;
+        # None means unset (everything may change). Cached hidden states per
+        # repeated prompt batch, see _stream_forward_once.
+        self.prefix_boundary: int | None = None
+        self._prefix_cache: dict[tuple[str, ...], tuple[int, list[Tensor], list[list[Tensor]]]] = {}
 
         for dtype in settings.dtypes:
             print(f"* Trying dtype [bold]{dtype}[/]...")
@@ -492,7 +497,7 @@ class Model:
 
         Returns True if the fast path was taken.
         """
-
+        self.prefix_boundary = None
         # If a prior model load was interrupted/cancelled mid-process, self.model will be None.
         current_model = None
         if self.model is not None:
@@ -1394,13 +1399,30 @@ class Model:
         # prefetch are still evicted after use. Prefetch window: three layers
         # ahead. The next layer is fully loaded onto the compute device while
         # this layer's chunks drain (side-stream copy on GPU boxes); the two
-        # behind it only get their bucket bytes read RAM-side, so their later
-        # hop starts warm. On CPU-only boxes both stages are the same hop.
+        # behind it only get their weights read through the loader once, so
+        # their later hop starts warm. On CPU-only boxes both stages are the
+        # same hop.
         resting = {id(layer): next(layer.parameters()).device for layer in layers}
         side = torch.cuda.Stream() if _cuda_usable() else None
         pending: torch.cuda.Event | None = None
 
-        for index, layer in enumerate(tqdm.tqdm(layers, desc="Streaming layers", leave=False)):
+        # Leading layers keep identical weights across trials (modifiers touch
+        # layers >= their start index only), so for a repeated prompt batch the
+        # hidden states up to that boundary are identical: resume the loop at
+        # the stored snapshot when one fits this call's boundary.
+        boundary = (
+            len(layers) if self.prefix_boundary is None else min(self.prefix_boundary, len(layers))
+        )
+        key = tuple(chat_prompts)
+        start = 0
+        entry = self._prefix_cache.get(key) if boundary > 0 else None
+        if entry is not None and entry[0] <= boundary:
+            start, hiddens, row_sets = entry
+            for state, hidden, rows in zip(states, hiddens, row_sets):
+                state["hidden"] = hidden
+                state["rows"] = list(rows)
+
+        for index, layer in enumerate(tqdm.tqdm(layers[start:], desc="Streaming layers", leave=False), start):
             for state in states:
                 # Mirrors Transformers' hidden-states collection: record the state entering
                 # each layer, then finally the normed last-layer output. Only the activation
@@ -1431,6 +1453,18 @@ class Model:
                 pending = self._prefetch_layer(ahead[0], resting, device, side)
                 for lookahead in ahead[1:]:
                     self._warm_layer(lookahead)
+
+            # Snapshot for the next identical prompt batch: hidden entering the
+            # boundary layer plus the rows recorded so far. shortcut: fixed FIFO
+            # of 8 batches; raise the cap if studies use many distinct eval sets.
+            if index == boundary - 1:
+                if len(self._prefix_cache) >= 8:
+                    self._prefix_cache.pop(next(iter(self._prefix_cache)))
+                self._prefix_cache[key] = (
+                    index + 1,
+                    [state["hidden"] for state in states],
+                    [list(state["rows"]) for state in states],
+                )
 
         # Both consumers (recorded rows, first-token logits) only use the last position: slice before norm/lm_head so the lm_head intermediate is one row per sequence instead of the full padded sequence (same rows out). Concatenating first makes norm and head read their weight matrices once per round instead of once per chunk; RMSNorm is row-wise, so the values are unchanged.
         last_rows = torch.cat([state["hidden"][:, -1, :].detach() for state in states])
@@ -1467,9 +1501,21 @@ class Model:
             # Accelerate fills a lazy offload map on the layer's first pre_forward;
             # until then the module holds meta placeholders, so only the eager
             # hook path can touch it. Skip ahead-of-time work for those layers.
-            if hook.weights_map is not None and next(layer.parameters()).device != device:
+            if next(layer.parameters()).device == device:
+                return None
+            if hook.weights_map is not None:
                 return self._upload_layer(layer, hook, device, side)
-            return None
+            # Some dispatches attach hooks without a weights map; the hook's own
+            # loader re-reads the weights on pre_forward. Drive that loader early
+            # on the side stream; the residency check in _call_layer then skips
+            # the reload inside the window.
+            event = torch.cuda.Event() if side is not None else None
+            with torch.cuda.stream(side) if side is not None else suppress():
+                hook.pre_forward(layer)
+            if event is None:
+                return None
+            event.record(side)
+            return event
         if side is None or resting[id(layer)] == device:
             return None
         event = torch.cuda.Event()
@@ -1485,12 +1531,22 @@ class Model:
         # a hook already rest in RAM. Tensors are released per weight, so peak
         # stays one weight above the prefetch window.
         hook = getattr(layer, "_hf_hook", None)
-        if hook is None or hook.weights_map is None or next(layer.parameters()).device != self.compute_device:
+        if hook is None:
             return
-        for name, _ in named_module_tensors(
-            layer, include_buffers=hook.offload_buffers, recurse=hook.place_submodules, remove_non_persistent=True
-        ):
-            hook.weights_map[name]
+        resident = next(layer.parameters()).device == self.compute_device
+        if hook.weights_map is not None:
+            if resident:
+                for name, _ in named_module_tensors(
+                    layer, include_buffers=hook.offload_buffers, recurse=hook.place_submodules, remove_non_persistent=True
+                ):
+                    hook.weights_map[name]
+            return
+        if resident:
+            return
+        # Hooks without a map restore from disk on touch: fill once through
+        # the loader, then park the module back so only OS cache grows.
+        hook.pre_forward(layer)
+        layer.to("meta")
 
     def _upload_layer(
         self, layer: Module, hook: Any, device: torch.device, side: torch.cuda.Stream | None
