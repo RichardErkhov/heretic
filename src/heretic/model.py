@@ -1450,9 +1450,14 @@ class Model:
 
             ahead = layers[index + 1 : index + 4]
             if ahead:
-                pending = self._prefetch_layer(ahead[0], resting, device, side)
-                for lookahead in ahead[1:]:
-                    self._warm_layer(lookahead)
+                # Full-upload the whole window; read-only warming is close to a
+                # no-op for hooks without a weights map, so the sweep tail used
+                # to serialize its load with compute. The last recorded event
+                # covers the earlier uploads on the same side stream.
+                for lookahead in ahead:
+                    event = self._prefetch_layer(lookahead, resting, device, side)
+                    if event is not None:
+                        pending = event
 
             # Snapshot for the next identical prompt batch: hidden entering the
             # boundary layer plus the rows recorded so far, parked in host RAM so
@@ -1495,7 +1500,7 @@ class Model:
         # layers load onto the compute device through their own pre_forward, so
         # call that early here instead: the weights stay resident and the
         # layer's own window skips the redundant reload (see _call_layer).
-        # Peak stays ~two largest layers + activations. The copy is ordered
+        # Peak stays ~four largest layers + activations. The copy is ordered
         # behind the current compute on the compute stream, so no event needed.
         hook = getattr(layer, "_hf_hook", None)
         if hook is not None:
@@ -1524,30 +1529,6 @@ class Model:
             layer.to(device)
         event.record(side)
         return event
-
-    def _warm_layer(self, layer: Module) -> None:
-        # Two stages behind the full prefetch: read the layer's offloaded
-        # weights through the hook's own loader so the later real load hits a
-        # warm cache instead of the disk, then drop the values. Weights without
-        # a hook already rest in RAM. Tensors are released per weight, so peak
-        # stays one weight above the prefetch window.
-        hook = getattr(layer, "_hf_hook", None)
-        if hook is None:
-            return
-        resident = next(layer.parameters()).device == self.compute_device
-        if hook.weights_map is not None:
-            if resident:
-                for name, _ in named_module_tensors(
-                    layer, include_buffers=hook.offload_buffers, recurse=hook.place_submodules, remove_non_persistent=True
-                ):
-                    hook.weights_map[name]
-            return
-        if resident:
-            return
-        # Hooks without a map restore from disk on touch: fill once through
-        # the loader, then park the module back so only OS cache grows.
-        hook.pre_forward(layer)
-        layer.to("meta")
 
     def _upload_layer(
         self, layer: Module, hook: Any, device: torch.device, side: torch.cuda.Stream | None
