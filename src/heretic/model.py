@@ -1453,9 +1453,19 @@ class Model:
                 # Full-upload the whole window; read-only warming is close to a
                 # no-op for hooks without a weights map, so the sweep tail used
                 # to serialize its load with compute. The last recorded event
-                # covers the earlier uploads on the same side stream.
+                # covers the earlier uploads on the same side stream. The seed
+                # is the last token of the round's first chunk: enough to walk
+                # the layer through a real forward so its loader and the page
+                # cache are warm before the window opens.
+                seed_kwargs: dict[str, Any] = {
+                    "position_ids": states[0]["kwargs"]["position_ids"][:, -1:]
+                }
+                pe = states[0]["kwargs"].get("position_embeddings")
+                if pe is not None:
+                    seed_kwargs["position_embeddings"] = tuple(t[:, -1:] for t in pe)
+                seed = (states[0]["hidden"][:, -1:, :], seed_kwargs)
                 for lookahead in ahead:
-                    event = self._prefetch_layer(lookahead, resting, device, side)
+                    event = self._prefetch_layer(lookahead, resting, device, side, seed)
                     if event is not None:
                         pending = event
 
@@ -1493,7 +1503,12 @@ class Model:
         return layer_states, lm_head(last_rows)
 
     def _prefetch_layer(
-        self, layer: Module, resting: dict[int, Any], device: torch.device, side: torch.cuda.Stream | None
+        self,
+        layer: Module,
+        resting: dict[int, Any],
+        device: torch.device,
+        side: torch.cuda.Stream | None,
+        seed: tuple[Tensor, dict[str, Any]],
     ) -> torch.cuda.Event | None:
         # Upload one layer on a side stream while the GPU digests the current
         # one; the event orders the compute stream behind the copy. Hook-managed
@@ -1511,13 +1526,27 @@ class Model:
                 return None
             if hook.weights_map is not None:
                 return self._upload_layer(layer, hook, device, side)
-            # Some dispatches attach hooks without a weights map; the hook's own
-            # loader re-reads the weights on pre_forward. Drive that loader early
-            # on the side stream; the residency check in _call_layer then skips
-            # the reload inside the window.
+            # Some dispatches attach hooks without a weights map: accelerate's
+            # loader fills the weights while the module itself runs, so drive a
+            # one-token dummy forward through the layer early on the side
+            # stream; a warm loader and page cache make the hop inside the
+            # window cheap. A rejected keyword set or mask rank only costs the
+            # overlap; the window still reloads lazily through _call_layer.
             event = torch.cuda.Event() if side is not None else None
+            forward = getattr(layer, "_old_forward", None)
+            hidden, call_kwargs = seed
             with torch.cuda.stream(side) if side is not None else suppress():
-                hook.pre_forward(layer)
+                for reduced in (False, True):
+                    kwargs = dict(call_kwargs)
+                    if reduced:
+                        kwargs.pop("position_embeddings", None)
+                    try:
+                        # Same reasoning as _call_layer: no graph, no pinned weights.
+                        with torch.no_grad():
+                            (forward if forward is not None else layer)(hidden, use_cache=False, **kwargs)
+                    except Exception:
+                        continue
+                    break
             if event is None:
                 return None
             event.record(side)
