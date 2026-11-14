@@ -2,7 +2,9 @@
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
 import os
+import threading
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any, TypeAlias, cast
@@ -156,8 +158,14 @@ def _cuda_usable() -> bool:
     # CUDA_VISIBLE_DEVICES="" keeps is_available() True with zero visible devices on some builds; gate on the count so device work falls back to CPU instead of failing with "Invalid device id".
     return torch.cuda.is_available() and torch.cuda.device_count() > 0
 
-# Pinned staging buffers reused per weight shape; fills and hops stay ordered on the single upload stream, so a buffer is never overwritten while its previous hop is in flight.
-_STAGING: dict[tuple[Any, Any], Tensor] = {}
+# Pinned staging buffers reused per weight shape, one set per worker thread: each thread's fills and hops only order against its own copies, so a buffer is never overwritten while its previous hop is in flight.
+_TLS = threading.local()
+# Lookahead worker: runs window loads while the GPU digests the current layer, so a
+# slow disk read no longer serializes against compute. One worker keeps per-thread
+# staging buffers and hook loader state single-owner; window depth is unchanged so VRAM
+# is too. shortcut: one worker per process; add per-device pools if multi-GPU streaming
+# ever needs parallel hops.
+_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="heretic-prefetch")
 
 
 class Model:
@@ -1404,7 +1412,7 @@ class Model:
         # same hop.
         resting = {id(layer): next(layer.parameters()).device for layer in layers}
         side = torch.cuda.Stream() if _cuda_usable() else None
-        pending: torch.cuda.Event | None = None
+        pending: list[tuple[int, Future | None]] = []
 
         # Leading layers keep identical weights across trials (modifiers touch
         # layers >= their start index only), so for a repeated prompt batch the
@@ -1432,11 +1440,17 @@ class Model:
                 # layer; their combined size is tiny next to the layer weights.
                 state["rows"].append(state["hidden"][:, -1, :].detach().clone())
 
-            if pending is not None:
-                # Order the compute stream behind the side-stream upload enqueued in
-                # the previous iteration without stalling the CPU here.
-                torch.cuda.current_stream().wait_event(pending)
-                pending = None
+            upload_event: torch.cuda.Event | None = None
+            while pending and pending[0][0] <= index:
+                _, handle = pending.pop(0)
+                # Joining returns the event the worker recorded after its hop.
+                # Entries drain in submission order, so the last event also
+                # covers the earlier uploads queued on the same side stream.
+                done = handle.result() if handle is not None else None
+                if done is not None:
+                    upload_event = done
+            if upload_event is not None:
+                torch.cuda.current_stream().wait_event(upload_event)
 
             items = [
                 (state["hidden"], {**state["kwargs"], "attention_mask": state["causal_masks"][index]})
@@ -1464,10 +1478,13 @@ class Model:
                 if pe is not None:
                     seed_kwargs["position_embeddings"] = tuple(t[:, -1:] for t in pe)
                 seed = (states[0]["hidden"][:, -1:, :], seed_kwargs)
-                for lookahead in ahead:
-                    event = self._prefetch_layer(lookahead, resting, device, side, seed)
-                    if event is not None:
-                        pending = event
+                for lookahead_index, lookahead in enumerate(ahead, index + 1):
+                    if side is None:
+                        self._prefetch_layer(lookahead, resting, device, side, seed)
+                    else:
+                        pending.append(
+                            (lookahead_index, _POOL.submit(self._prefetch_layer, lookahead, resting, device, side, seed))
+                        )
 
             # Snapshot for the next identical prompt batch: hidden entering the
             # boundary layer plus the rows recorded so far, parked in host RAM so
@@ -1583,10 +1600,11 @@ class Model:
                 value = hook.weights_map[name]
                 if side is not None:
                     key = (tuple(value.shape), value.dtype)
-                    staged = _STAGING.get(key)
+                    buffers = _TLS.__dict__.setdefault("buffers", {})
+                    staged = buffers.get(key)
                     if staged is None:
                         staged = torch.empty(key[0], dtype=key[1], pin_memory=True)
-                        _STAGING[key] = staged
+                        buffers[key] = staged
                     staged.copy_(value)
                     value = staged
                 set_module_tensor_to_device(
