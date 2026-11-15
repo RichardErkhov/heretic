@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+import json
 import os
-import threading
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
@@ -11,6 +11,7 @@ from typing import Any, TypeAlias, cast
 
 import torch
 import tqdm
+from safetensors import safe_open
 from accelerate.utils import named_module_tensors, set_module_tensor_to_device
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch import FloatTensor, LongTensor, Tensor
@@ -158,14 +159,52 @@ def _cuda_usable() -> bool:
     # CUDA_VISIBLE_DEVICES="" keeps is_available() True with zero visible devices on some builds; gate on the count so device work falls back to CPU instead of failing with "Invalid device id".
     return torch.cuda.is_available() and torch.cuda.device_count() > 0
 
-# Pinned staging buffers reused per weight shape, one set per worker thread: each thread's fills and hops only order against its own copies, so a buffer is never overwritten while its previous hop is in flight.
-_TLS = threading.local()
-# Lookahead worker: runs window loads while the GPU digests the current layer, so a
-# slow disk read no longer serializes against compute. One worker keeps per-thread
-# staging buffers and hook loader state single-owner; window depth is unchanged so VRAM
-# is too. shortcut: one worker per process; add per-device pools if multi-GPU streaming
-# ever needs parallel hops.
-_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="heretic-prefetch")
+# Lookahead workers: run window loads while the GPU digests the current layer, so a
+# slow disk read no longer serializes against compute. Pool size matches the lookahead
+# window depth (three layers), so window layers' disk reads overlap instead of queueing
+# behind one worker; pinned staging is per tensor, so workers share no buffers. The
+# drain joins per event, so completion order between workers does not matter. shortcut:
+# one pool per process; add per-device pools if multi-GPU streaming ever needs parallel hops.
+_POOL = ThreadPoolExecutor(max_workers=3, thread_name_prefix="heretic-prefetch")
+
+def _load_head_weights(model_id: str, revision: str | None) -> tuple[Tensor, Tensor | None] | None:
+    # Pull the language head (falling back to the tied embedding matrix) out of
+    # the cached checkpoint so the streamed path can keep one copy resident.
+    folder: str | None = model_id if os.path.isdir(model_id) else None
+    if folder is None:
+        hub = os.environ.get("HF_HUB_CACHE") or os.path.join(
+            os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub"
+        )
+        root = os.path.join(hub, f"models--{model_id.replace('/', '--')}", "snapshots")
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            return None
+        if revision is not None:
+            names = [name for name in names if name.startswith(revision)] or names
+        if not names:
+            return None
+        folder = os.path.join(root, names[-1])
+    shard = os.path.join(folder, "model.safetensors")
+    try:
+        index = os.path.join(folder, "model.safetensors.index.json")
+        if os.path.exists(index):
+            with open(index, encoding="utf-8") as handle:
+                weight_map: dict[str, str] = json.load(handle)["weight_map"]
+            shard = os.path.join(folder, weight_map.get("lm_head.weight", "model.safetensors"))
+        with safe_open(shard, framework="pt") as handle:
+            keys = list(handle.keys())
+            key = (
+                "lm_head.weight"
+                if "lm_head.weight" in keys
+                else next(k for k in keys if k.endswith("embed_tokens.weight"))
+            )
+            bias_key = key.removesuffix("weight") + "bias"
+            weight = handle.get_tensor(key)
+            bias = handle.get_tensor(bias_key) if bias_key in keys else None
+        return weight, bias
+    except Exception:
+        return None
 
 
 class Model:
@@ -263,6 +302,8 @@ class Model:
         # repeated prompt batch, see _stream_forward_once.
         self.prefix_boundary: int | None = None
         self._prefix_cache: dict[tuple[str, ...], tuple[int, list[Tensor], list[list[Tensor]]]] = {}
+        # GPU-resident lm_head weights per module (see _apply_head).
+        self._head_cache: dict[Module, tuple[Tensor, Tensor | None] | None] = {}
 
         for dtype in settings.dtypes:
             print(f"* Trying dtype [bold]{dtype}[/]...")
@@ -1209,6 +1250,28 @@ class Model:
     def _finish_pass(self) -> None:
         self._progress_bar().update(1)
 
+    def _apply_head(self, lm_head: Module, hidden_states: Tensor) -> Tensor:
+        # The dispatch loader re-materializes the head weight on every forward;
+        # apply it functionally from one GPU-resident copy instead. Anything the
+        # cached copy cannot match exactly (quantized dtypes, exotic layouts)
+        # falls back to the module's own path.
+        if lm_head not in self._head_cache:
+            entry = _load_head_weights(
+                self.settings.model, self.revision_kwargs.get("revision")
+            )
+            self._head_cache[lm_head] = None if entry is None else (
+                entry[0].to(hidden_states),
+                None if entry[1] is None else entry[1].to(hidden_states),
+            )
+        cached = self._head_cache[lm_head]
+        if cached is None:
+            return lm_head(hidden_states)
+        weight, bias = cached
+        if weight.dtype != lm_head.weight.dtype:
+            return lm_head(hidden_states)
+        return torch.nn.functional.linear(hidden_states, weight, bias)
+
+
     def _stream_forward(
         self, prompts: list[Prompt], suffixes: list[str] | None = None
     ) -> tuple[list[Tensor], Tensor]:
@@ -1429,6 +1492,9 @@ class Model:
             for state, hidden, rows in zip(states, hiddens, row_sets):
                 state["hidden"] = hidden.to(device)
                 state["rows"] = [row.to(device) for row in rows]
+        # Lookahead layers sit in the window of several iterations; submit each once so a
+        # layer is never uploaded twice and never half-uploaded when its forward runs.
+        queued_until = start
 
         for index, layer in enumerate(tqdm.tqdm(layers[start:], desc="Streaming layers", leave=False), start):
             for state in states:
@@ -1440,17 +1506,14 @@ class Model:
                 # layer; their combined size is tiny next to the layer weights.
                 state["rows"].append(state["hidden"][:, -1, :].detach().clone())
 
-            upload_event: torch.cuda.Event | None = None
             while pending and pending[0][0] <= index:
                 _, handle = pending.pop(0)
                 # Joining returns the event the worker recorded after its hop.
-                # Entries drain in submission order, so the last event also
-                # covers the earlier uploads queued on the same side stream.
+                # Workers finish out of submission order, so every popped event
+                # gets its own wait instead of trusting the last one.
                 done = handle.result() if handle is not None else None
                 if done is not None:
-                    upload_event = done
-            if upload_event is not None:
-                torch.cuda.current_stream().wait_event(upload_event)
+                    torch.cuda.current_stream().wait_event(done)
 
             items = [
                 (state["hidden"], {**state["kwargs"], "attention_mask": state["causal_masks"][index]})
@@ -1466,8 +1529,8 @@ class Model:
             if ahead:
                 # Full-upload the whole window; read-only warming is close to a
                 # no-op for hooks without a weights map, so the sweep tail used
-                # to serialize its load with compute. The last recorded event
-                # covers the earlier uploads on the same side stream. The seed
+                # to serialize its load with compute. Every upload carries its own
+                # event; the drain waits on each popped event. The seed
                 # is the last token of the round's first chunk: enough to walk
                 # the layer through a real forward so its loader and the page
                 # cache are warm before the window opens.
@@ -1479,6 +1542,9 @@ class Model:
                     seed_kwargs["position_embeddings"] = tuple(t[:, -1:] for t in pe)
                 seed = (states[0]["hidden"][:, -1:, :], seed_kwargs)
                 for lookahead_index, lookahead in enumerate(ahead, index + 1):
+                    if lookahead_index <= queued_until:
+                        continue
+                    queued_until = lookahead_index
                     if side is None:
                         self._prefetch_layer(lookahead, resting, device, side, seed)
                     else:
@@ -1517,7 +1583,7 @@ class Model:
             for boundary in range(len(states[0]["rows"]))
         ]
 
-        return layer_states, lm_head(last_rows)
+        return layer_states, self._apply_head(lm_head, last_rows)
 
     def _prefetch_layer(
         self,
@@ -1599,12 +1665,11 @@ class Model:
             ):
                 value = hook.weights_map[name]
                 if side is not None:
-                    key = (tuple(value.shape), value.dtype)
-                    buffers = _TLS.__dict__.setdefault("buffers", {})
-                    staged = buffers.get(key)
-                    if staged is None:
-                        staged = torch.empty(key[0], dtype=key[1], pin_memory=True)
-                        buffers[key] = staged
+                    # One pinned buffer per tensor from torch's caching host allocator:
+                    # the next tensor's fill overlaps the hop enqueued before it
+                    # instead of waiting on a shared buffer. Blocks recycle once
+                    # their hop completes, so reuse survives without sharing.
+                    staged = torch.empty(value.shape, dtype=value.dtype, pin_memory=True)
                     staged.copy_(value)
                     value = staged
                 set_module_tensor_to_device(
