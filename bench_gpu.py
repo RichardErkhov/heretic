@@ -42,7 +42,7 @@ def post(module, inputs, outputs):
 
 
 t_load0 = time.perf_counter()
-model = Model(Settings(model="Qwen/Qwen3.5-9B", stream_layers=streamed, batch_size=2))
+model = Model(Settings(model="Qwen/Qwen3.5-9B", stream_layers=streamed, batch_size=int(os.environ.get("HERETIC_BS", "2"))))
 t_load = time.perf_counter() - t_load0
 rss_after_load = Process().memory_info().rss / 1024**3
 

@@ -3,6 +3,7 @@
 
 import json
 import os
+import threading
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
@@ -167,6 +168,27 @@ def _cuda_usable() -> bool:
 # one pool per process; add per-device pools if multi-GPU streaming ever needs parallel hops.
 _POOL = ThreadPoolExecutor(max_workers=3, thread_name_prefix="heretic-prefetch")
 
+# Pinned staging ring per (shape, dtype): the caching host allocator does not
+# coalesce pinned blocks on this box, so fresh alloc/free per tensor per hop
+# dominates the copy phase. Slots recycle round-robin; each slot remembers the
+# event of its last hop and the next fill waits on it, so the copy stays piped
+# behind compute without ever overwriting a buffer that is still in flight.
+_STAGE_DEPTH = 3
+_STAGE_LOCK = threading.Lock()
+_STAGING: dict[Any, list[list[Any]]] = {}
+
+def _take_stage(shape: Any, dtype: Any) -> list[Any]:
+    key = (tuple(shape), dtype)
+    with _STAGE_LOCK:
+        ring = _STAGING.setdefault(key, [[None, None] for _ in range(_STAGE_DEPTH)])
+        slot = ring.pop(0)
+        ring.append(slot)
+    if slot[1] is not None:
+        slot[1].synchronize()
+    if slot[0] is None:
+        slot[0] = torch.empty(shape, dtype=dtype, pin_memory=True)
+    return slot
+
 def _load_head_weights(model_id: str, revision: str | None) -> tuple[Tensor, Tensor | None] | None:
     # Pull the language head (falling back to the tied embedding matrix) out of
     # the cached checkpoint so the streamed path can keep one copy resident.
@@ -222,6 +244,9 @@ class Model:
         self.settings = settings
         self.needs_reload = False
         self.stream_fallback_reason: str | None = None
+        self._hold_enabled = False
+        self._held: dict[int, tuple[Module, Any]] = {}
+        self._pin_cache: dict[int, dict[str, Tensor]] = {}
 
         self.revision_kwargs = {}
         if settings.model_commit is not None:
@@ -561,6 +586,7 @@ class Model:
 
         # Purge existing model object from memory to make space.
         self.model = None
+        self._held.clear()
         empty_cache()
 
         quantization_config = self._get_quantization_config(
@@ -840,19 +866,26 @@ class Model:
         eos_token_id = self.tokenizer.eos_token_id
         finished = [False] * len(chat_prompts)
 
-        for _ in range(max_new_tokens):
-            _, logits = self._stream_forward(prompts, continuations)
+        # Decode re-walks the same layer list every step, so keeping the layers
+        # resident between steps skips nearly all of the reload work; the flag is
+        # off again in _release_held when generation ends.
+        self._hold_enabled = _cuda_usable()
+        try:
+            for _ in range(max_new_tokens):
+                _, logits = self._stream_forward(prompts, continuations)
 
-            for row, token_id in enumerate(logits.argmax(dim=-1).tolist()):
-                if finished[row]:
-                    continue
-                if token_id == eos_token_id:
-                    finished[row] = True
-                else:
-                    continuations[row] += self.tokenizer.decode([token_id])
+                for row, token_id in enumerate(logits.argmax(dim=-1).tolist()):
+                    if finished[row]:
+                        continue
+                    if token_id == eos_token_id:
+                        finished[row] = True
+                    else:
+                        continuations[row] += self.tokenizer.decode([token_id])
 
-            if all(finished):
-                break
+                if all(finished):
+                    break
+        finally:
+            self._release_held()
 
         inputs = self.tokenizer(
             chat_prompts,
@@ -1291,6 +1324,7 @@ class Model:
                     return result
                 except Exception as error:
                     self.stream_fallback_reason = format_exception(error)
+                    self._release_held()
                     print(
                         f"* Streamed forward unavailable ({self.stream_fallback_reason}), falling back to eager forward."
                     )
@@ -1525,7 +1559,8 @@ class Model:
             for state, hidden in zip(states, hidden_states_list):
                 state["hidden"] = hidden
 
-            ahead = layers[index + 1 : index + 4]
+            depth = int(os.environ.get("HERETIC_PREFETCH_DEPTH", "3"))
+            ahead = layers[index + 1 : index + 1 + depth]
             if ahead:
                 # Full-upload the whole window; read-only warming is close to a
                 # no-op for hooks without a weights map, so the sweep tail used
@@ -1609,6 +1644,9 @@ class Model:
                 return None
             if hook.weights_map is not None:
                 return self._upload_layer(layer, hook, device, side)
+            cached = self._hop_from_cache(layer, device, side)
+            if cached is not None:
+                return cached
             # Some dispatches attach hooks without a weights map: accelerate's
             # loader fills the weights while the module itself runs, so drive a
             # one-token dummy forward through the layer early on the side
@@ -1634,13 +1672,85 @@ class Model:
                 return None
             event.record(side)
             return event
-        if side is None or resting[id(layer)] == device:
+        if side is None or resting[id(layer)] == device or next(layer.parameters()).device == device:
             return None
+        cached = self._hop_from_cache(layer, device, side)
+        if cached is not None:
+            return cached
         event = torch.cuda.Event()
         with torch.cuda.stream(side):
             layer.to(device)
         event.record(side)
         return event
+
+    def _hop_from_cache(self, layer: Module, device: Any, side: Any) -> Any:
+        # Steady-state hop for streamed layers: copy the pinned host snapshot
+        # made at the first eviction straight onto the compute device. Skips
+        # accelerate's pageable safetensors reload for hooks without a weights
+        # map and the plain CPU->GPU move for hook-less layers. Same values as
+        # the loader would produce: the buffer holds exactly what was evicted.
+        cache = self._pin_cache.get(id(layer))
+        if cache is None:
+            return None
+        event = torch.cuda.Event() if side is not None else None
+        with torch.cuda.stream(side) if side is not None else suppress():
+            for name, buf in cache.items():
+                set_module_tensor_to_device(layer, name, device, value=buf, non_blocking=side is not None)
+        if event is None:
+            return None
+        event.record(side)
+        return event
+
+    def _capture_pinned(self, layer: Module) -> None:
+        # One-time pinned host snapshot per layer, taken while the weights are
+        # still on the compute device. Total pinned RAM is about one copy of
+        # the streamed layers; allocation failure keeps the loader path.
+        if id(layer) in self._pin_cache or not _cuda_usable():
+            return
+        cache: dict[str, Tensor] = {}
+        try:
+            for name, tensor in named_module_tensors(layer, include_buffers=True, recurse=True):
+                if tensor.is_meta:
+                    continue
+                buf = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+                buf.copy_(tensor.detach(), non_blocking=True)
+                cache[name] = buf
+            torch.cuda.current_stream().synchronize()
+        except Exception:
+            return
+        self._pin_cache[id(layer)] = cache
+
+    def _hold_layer(self, layer: Module, origin: Any, hook: Any) -> bool:
+        if not self._hold_enabled:
+            return False
+        # Between decode steps the same layers are needed again within seconds,
+        # so with room to spare keep this one on the compute device instead of
+        # evicting and reloading. The free-space check runs when the layer is
+        # touched, so a big batch's activations squeeze the cache instead of
+        # colliding with it.
+        # shortcut: fixed 2 GiB activation margin; make it scale with batch size
+        # if generation at large batch starts hitting the eager fallback.
+        if hook is not None and getattr(hook, "weights_map", None) is not None:
+            tensors = hook.weights_map.values()
+        else:
+            tensors = [*layer.parameters(), *layer.buffers()]
+        nbytes = sum(t.numel() * t.element_size() for t in tensors)
+        free, _total = torch.cuda.mem_get_info()
+        if nbytes > free - 2**31:
+            return False
+        self._held[id(layer)] = (layer, origin)
+        return True
+
+    def _release_held(self) -> None:
+        self._hold_enabled = False
+        for layer, origin in self._held.values():
+            hook = getattr(layer, "_hf_hook", None)
+            if hook is not None:
+                hook.post_forward(layer, None)
+            elif next(layer.parameters()).device != origin:
+                layer.to(origin)
+        self._held.clear()
+        empty_cache()
 
     def _upload_layer(
         self, layer: Module, hook: Any, device: torch.device, side: torch.cuda.Stream | None
@@ -1656,6 +1766,7 @@ class Model:
         # pre_forward does.
         hook.tied_pointers_to_remove = set()
         event = torch.cuda.Event() if side is not None else None
+        used: list[Any] = []
         with torch.cuda.stream(side) if side is not None else suppress():
             for name, _ in named_module_tensors(
                 layer,
@@ -1665,13 +1776,15 @@ class Model:
             ):
                 value = hook.weights_map[name]
                 if side is not None:
-                    # One pinned buffer per tensor from torch's caching host allocator:
-                    # the next tensor's fill overlaps the hop enqueued before it
-                    # instead of waiting on a shared buffer. Blocks recycle once
-                    # their hop completes, so reuse survives without sharing.
-                    staged = torch.empty(value.shape, dtype=value.dtype, pin_memory=True)
+                    # See _take_stage: ring slot holds the pinned buffer plus the
+                    # event of the hop that last read it. Different shapes keep
+                    # independent rings, so the next tensor's fill still overlaps
+                    # the hop enqueued before it.
+                    slot = _take_stage(value.shape, value.dtype)
+                    staged = slot[0]
                     staged.copy_(value)
                     value = staged
+                    used.append(slot)
                 set_module_tensor_to_device(
                     layer,
                     name,
@@ -1685,6 +1798,8 @@ class Model:
         if event is None:
             return None
         event.record(side)
+        for slot in used:
+            slot[1] = event
         return event
 
     def _call_layer(
@@ -1732,11 +1847,13 @@ class Model:
 
             return outputs
         finally:
-            if hook is not None:
-                hook.post_forward(layer, outputs[-1] if outputs else None)
-            if moved:
-                layer.to(origin)
-                empty_cache()
+            if not self._hold_layer(layer, origin, hook):
+                self._capture_pinned(layer)
+                if hook is not None:
+                    hook.post_forward(layer, outputs[-1] if outputs else None)
+                if moved:
+                    layer.to(origin)
+                    empty_cache()
 
     def _eager_forward_once(self, prompts: list[Prompt]) -> tuple[list[Tensor], Tensor]:
         _, outputs = self._eager_generate(
