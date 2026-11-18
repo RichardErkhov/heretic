@@ -2,6 +2,7 @@
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
 import json
+import mmap
 import os
 import threading
 from collections.abc import Callable
@@ -13,7 +14,7 @@ from typing import Any, TypeAlias, cast
 import torch
 import tqdm
 from safetensors import safe_open
-from accelerate.utils import named_module_tensors, set_module_tensor_to_device
+from accelerate.utils import find_device, named_module_tensors, send_to_device, set_module_tensor_to_device
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch import FloatTensor, LongTensor, Tensor
 from torch.nn import Module, ModuleList
@@ -161,11 +162,15 @@ def _cuda_usable() -> bool:
     return torch.cuda.is_available() and torch.cuda.device_count() > 0
 
 # Lookahead workers: run window loads while the GPU digests the current layer, so a
-# slow disk read no longer serializes against compute. Pool size matches the lookahead
-# window depth (three layers), so window layers' disk reads overlap instead of queueing
-# behind one worker; pinned staging is per tensor, so workers share no buffers. The
+# slow disk read no longer serializes against compute. Pool size matches a deep
+# lookahead window; pinned staging is per tensor, so workers share no buffers. The
 # drain joins per event, so completion order between workers does not matter. shortcut:
 # one pool per process; add per-device pools if multi-GPU streaming ever needs parallel hops.
+# Default window matches the pool: three layers ahead so a worker always has
+# one queued while the current hop uploads. The bs=2 reload rounds measured a
+# ~2.5s avg gain over a two-layer window (avg 50.8s vs 53.3s paired rounds);
+# compute-bound rounds (bs=128) are unaffected. Tune per host with
+# HERETIC_PREFETCH_DEPTH.
 _POOL = ThreadPoolExecutor(max_workers=3, thread_name_prefix="heretic-prefetch")
 
 # Pinned staging ring per (shape, dtype): the caching host allocator does not
@@ -189,24 +194,78 @@ def _take_stage(shape: Any, dtype: Any) -> list[Any]:
         slot[0] = torch.empty(shape, dtype=dtype, pin_memory=True)
     return slot
 
+def _snapshot_folder(model_id: str, revision: str | None) -> str | None:
+    # On-disk HF cache folder for a model id: a local dir passes through, hub
+    # ids resolve to the newest (or matching-revision) snapshot directory.
+    if os.path.isdir(model_id):
+        return model_id
+    hub = os.environ.get("HF_HUB_CACHE") or os.path.join(
+        os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub"
+    )
+    root = os.path.join(hub, f"models--{model_id.replace('/', '--')}", "snapshots")
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return None
+    if revision is not None:
+        names = [name for name in names if name.startswith(revision)] or names
+    return os.path.join(root, names[-1]) if names else None
+
+# Bulk hop source: mmap each shard once and slice tensors straight from the
+# map, so cached hop fills are page-cache -> pinned slot -> device without the
+# intermediate CPU tensor the safetensors handle builds per get. Best-effort:
+# None anywhere falls back to the weights_map path.
+_MM_DTYPES = {
+    "F64": torch.float64,
+    "F32": torch.float32,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "I64": torch.int64,
+    "I32": torch.int32,
+    "I16": torch.int16,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
+_BULK_INDEX: dict[str, dict[str, tuple[Any, ...]]] = {}
+
+def _bulk_index(model_id: str, revision: str | None) -> dict[str, tuple[Any, ...]] | None:
+    cached = _BULK_INDEX.get(model_id)
+    if cached is not None:
+        return cached
+    index: dict[str, tuple[Any, ...]] = {}
+    try:
+        folder = _snapshot_folder(model_id, revision)
+        if folder is None:
+            return None
+        manifest = os.path.join(folder, "model.safetensors.index.json")
+        if os.path.exists(manifest):
+            with open(manifest, encoding="utf-8") as handle:
+                shards = sorted(set(json.load(handle)["weight_map"].values()))
+        else:
+            shards = ["model.safetensors"]
+        for shard_name in shards:
+            with open(os.path.join(folder, shard_name), "rb") as handle:
+                # safetensors prefix: little-endian u64 header length at byte 0.
+                length = int.from_bytes(handle.read(8), "little")
+                header = json.loads(handle.read(length))
+                mapping = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+            for key, meta in header.items():
+                if not isinstance(meta, dict):
+                    continue
+                begin, end = meta["data_offsets"]
+                index[key] = (mapping, 8 + length + begin, 8 + length + end, _MM_DTYPES[meta["dtype"]], tuple(meta["shape"]))
+    except Exception:
+        return None
+    _BULK_INDEX[model_id] = index
+    return index
+
 def _load_head_weights(model_id: str, revision: str | None) -> tuple[Tensor, Tensor | None] | None:
     # Pull the language head (falling back to the tied embedding matrix) out of
     # the cached checkpoint so the streamed path can keep one copy resident.
-    folder: str | None = model_id if os.path.isdir(model_id) else None
+    folder = _snapshot_folder(model_id, revision)
     if folder is None:
-        hub = os.environ.get("HF_HUB_CACHE") or os.path.join(
-            os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub"
-        )
-        root = os.path.join(hub, f"models--{model_id.replace('/', '--')}", "snapshots")
-        try:
-            names = sorted(os.listdir(root))
-        except OSError:
-            return None
-        if revision is not None:
-            names = [name for name in names if name.startswith(revision)] or names
-        if not names:
-            return None
-        folder = os.path.join(root, names[-1])
+        return None
     shard = os.path.join(folder, "model.safetensors")
     try:
         index = os.path.join(folder, "model.safetensors.index.json")
@@ -227,6 +286,39 @@ def _load_head_weights(model_id: str, revision: str | None) -> tuple[Tensor, Ten
         return weight, bias
     except Exception:
         return None
+
+
+def _warm_blob_pages(model_id: str, revision: str | None) -> None:
+    # Sequential whole-file reads run ~3x faster than safetensors' per-tensor
+    # scatter reads (see .scratch/readrate.py), and with the working-set ceiling
+    # above they stay in the file cache for the loader to hit. Best effort:
+    # does nothing when the snapshot folder cannot be located.
+    folder = model_id if os.path.isdir(model_id) else None
+    if folder is None:
+        hub = os.environ.get("HF_HUB_CACHE") or os.path.join(
+            os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub"
+        )
+        root = os.path.join(hub, f"models--{model_id.replace('/', '--')}", "snapshots")
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            return
+        if revision is not None:
+            names = [name for name in names if name.startswith(revision)] or names
+        if not names:
+            return
+        folder = os.path.join(root, names[-1])
+    try:
+        shards = sorted(
+            (entry.path for entry in os.scandir(folder) if entry.name.endswith(".safetensors")),
+            key=os.path.getsize,
+        )
+        for path in shards:
+            with open(path, "rb") as handle:
+                while handle.read(2**22):
+                    pass
+    except OSError:
+        return
 
 
 class Model:
@@ -307,20 +399,33 @@ class Model:
                        "disk": float("inf")} if settings.stream_layers else None)
         )
 
+        warm_job = None
         if settings.stream_layers and os.name == "nt":
-            # Windows counts warm file pages in process RSS, so a disk-streamed
-            # load looks RAM-backed even though only the touched layer is ever
-            # needed. Cap the working set: the OS then trims the disk cache
-            # towards the layer working set instead of the whole checkpoint.
+            # Windows counts warm file pages in process RSS, so cap the working
+            # set just below physical RAM instead of one layer: the warm read
+            # below and the loader's scatter reads then keep hitting the file
+            # cache (~2GB/s hits instead of ~0.6GB/s re-reads). On hosts
+            # smaller than the checkpoint the cache holds what fits and the
+            # floor still lets the OS reclaim memory under pressure.
             import ctypes
 
             kernel32 = ctypes.windll.kernel32
             handle = kernel32.GetCurrentProcess()
+            installed_kb = ctypes.c_ulong()
+            installed = kernel32.GetPhysicallyInstalledSystemMemory(ctypes.byref(installed_kb))
+            ceiling = max(installed_kb.value * 1024 - 2**30, 4 * 2**30) if installed else 8 * 2**30
             kernel32.SetProcessWorkingSetSize(
-                handle, ctypes.c_size_t(512 * 2**20), ctypes.c_size_t(8 * 2**30)
+                handle, ctypes.c_size_t(512 * 2**20), ctypes.c_size_t(ceiling)
             )
             ctypes.WinDLL("psapi").EmptyWorkingSet(handle)
+            # Warm concurrently with the loader: the bar is CPU-copy bound
+            # and leaves disk idle, so the sequential warm reads use that
+            # slack and the hop-fill sweep finds its pages cached.
+            warm_job = _POOL.submit(
+                _warm_blob_pages, settings.model, self.revision_kwargs.get("revision")
+            )
 
+        self._model_id = settings.model
         self.trusted_models = set()
         # Layers [0, prefix_boundary) keep their base weights across trials;
         # None means unset (everything may change). Cached hidden states per
@@ -363,6 +468,8 @@ class Model:
                 )
 
                 self.dtype = self.model.dtype
+                if warm_job is not None:
+                    warm_job.result()
 
                 # If we reach this point and the model requires trust_remote_code,
                 # the user must have agreed when prompted to execute remote code,
@@ -455,6 +562,9 @@ class Model:
             # as VL models are typically just causal LMs with an added image encoder.
             task_type="CAUSAL_LM",
         )
+        # peft re-bins target_modules into an unordered set in __post_init__;
+        # restore sorted order so saved adapter_config.json is byte-stable.
+        self.peft_config.target_modules = sorted(self.peft_config.target_modules)
 
         # self.peft_config is a LoraConfig object rather than a dictionary,
         # so the result is a PeftModel rather than a PeftMixedModel.
@@ -492,6 +602,13 @@ class Model:
         Returns:
             BitsAndBytesConfig or None
         """
+        # Checkpoints that ship already-compressed weights (e.g. FP8) carry a
+        # native quantization_config and reject a second BitsAndBytesConfig on
+        # top; their weights are already small, so keep the native one.
+        # Mirrors get_model_class: get_config_dict yields the config mappings.
+        configs = PretrainedConfig.get_config_dict(self.settings.model)
+        if any(cfg.get("quantization_config") for cfg in configs):
+            return None
         if self.settings.quantization == QuantizationMethod.BNB_4BIT:
             # BitsAndBytesConfig expects a torch.dtype, not a string.
             if dtype == "auto":
@@ -1697,7 +1814,9 @@ class Model:
             for name, buf in cache.items():
                 set_module_tensor_to_device(layer, name, device, value=buf, non_blocking=side is not None)
         if event is None:
-            return None
+            # Synchronous hop hit: truthy tells callers the weights landed so
+            # they skip accelerate's pageable safetensors reload entirely.
+            return True
         event.record(side)
         return event
 
@@ -1752,6 +1871,24 @@ class Model:
         self._held.clear()
         empty_cache()
 
+    def _bulk_layer(self, layer: Module, names: list[str]) -> dict[str, tuple[Any, ...]] | None:
+        # mmap slices for this layer's tensors keyed by the hook's relative
+        # names; None falls back to accelerate's weights_map reads. Checkpoint
+        # keys carry the module path, relative names do not, so prefix once.
+        if not names:
+            return None
+        index = _bulk_index(self._model_id, self.revision_kwargs.get("revision"))
+        if index is None:
+            return None
+        prefix = next((p for p, m in self.model.named_modules() if m is layer), None)
+        out: dict[str, tuple[Any, ...]] = {}
+        for name in names:
+            entry = index.get(f"{prefix}.{name}" if prefix else name)
+            if entry is None:
+                return None
+            out[name] = entry
+        return out
+
     def _upload_layer(
         self, layer: Module, hook: Any, device: torch.device, side: torch.cuda.Stream | None
     ) -> torch.cuda.Event | None:
@@ -1767,14 +1904,24 @@ class Model:
         hook.tied_pointers_to_remove = set()
         event = torch.cuda.Event() if side is not None else None
         used: list[Any] = []
-        with torch.cuda.stream(side) if side is not None else suppress():
+        names = [
+            name
             for name, _ in named_module_tensors(
                 layer,
                 include_buffers=hook.offload_buffers,
                 recurse=hook.place_submodules,
                 remove_non_persistent=True,
-            ):
-                value = hook.weights_map[name]
+            )
+        ]
+        bulk = self._bulk_layer(layer, names)
+        with torch.cuda.stream(side) if side is not None else suppress():
+            for name in names:
+                entry = bulk[name] if bulk is not None else None
+                if entry is not None:
+                    mapping, begin, end, dtype, shape = entry
+                    value = torch.frombuffer(memoryview(mapping)[begin:end], dtype=dtype).reshape(shape)
+                else:
+                    value = hook.weights_map[name]
                 if side is not None:
                     # See _take_stage: ring slot holds the pinned buffer plus the
                     # event of the hop that last read it. Different shapes keep
@@ -1822,8 +1969,16 @@ class Model:
         outputs: list[Tensor] = []
         try:
             if hook is not None and next(layer.parameters()).device != compute:
-                # Already uploaded by the previous window's prefetch.
-                hook.pre_forward(layer)
+                # Already uploaded by the previous window's prefetch, or hop the
+                # pinned snapshot in: the hook's own loader re-reads safetensors
+                # pageable per step, the pinned hop is the same bytes from RAM.
+                if self._hop_from_cache(layer, compute, None) is None:
+                    hook.pre_forward(layer)
+                # Snapshot right after the loader filled the weights: the hook's
+                # registered forward hooks restore meta placeholders by the time
+                # the forward returns, so the finally-block snapshot only ever
+                # sees meta and stores nothing.
+                self._capture_pinned(layer)
 
             for hidden_states, call_kwargs in items:
                 # (older decoder layers have no `position_embeddings` parameter and compute
@@ -1847,8 +2002,11 @@ class Model:
 
             return outputs
         finally:
+            # Snapshot while the weights are still on the compute device, even
+            # when the hold succeeds: the loader restores meta placeholders
+            # between steps, so every touch reloads from somewhere anyway.
+            self._capture_pinned(layer)
             if not self._hold_layer(layer, origin, hook):
-                self._capture_pinned(layer)
                 if hook is not None:
                     hook.post_forward(layer, outputs[-1] if outputs else None)
                 if moved:
@@ -1903,6 +2061,35 @@ class Model:
             skip_prompt=True,
             skip_special_tokens=True,
         )
+
+        # Every decode step drives the hook loader again; make it start from the
+        # pinned snapshot made during the init pass so steps after the first
+        # copy weights from RAM instead of re-reading safetensors per step.
+        compute = self.compute_device
+        hop = self._hop_from_cache
+        capture = self._capture_pinned
+        for layer in self.get_layers():
+            hook = getattr(layer, "_hf_hook", None)
+            if hook is None or getattr(hook, "_heretic_hop_first", False):
+                continue
+            hook._heretic_hop_first = True
+            hook.tied_pointers_to_remove = getattr(hook, "tied_pointers_to_remove", set())
+            load = hook.pre_forward
+
+            def hop_first(module: Module, *args: Any, _hook=hook, _load=load, _hop=hop, _cap=capture, _dev=compute, **kwargs: Any) -> Any:
+                # Hop hit leaves real weights on the compute device, so skip
+                # the hook's pageable reload and only align the call args the
+                # way its own pre_forward does. Miss keeps the original loader
+                # path and snapshots the fresh weights for the next hop.
+                if _hop(module, _dev, None) is True:
+                    if _hook.io_same_device:
+                        _hook.input_device = find_device([args, kwargs])
+                    return send_to_device(args, _dev), send_to_device(kwargs, _dev, skip_keys=_hook.skip_keys)
+                out = _load(module, *args, **kwargs)
+                _cap(module)
+                return out
+
+            hook.pre_forward = hop_first
 
         # FIXME: The type checker has been disabled here because of the extremely complex
         #        interplay between different generate() signatures and dynamic delegation.

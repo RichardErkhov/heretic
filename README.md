@@ -29,7 +29,7 @@ All in an afternoon, on your gaming PC.
 [^1]: Heretic supports on-the-fly 4-bit model quantization with bitsandbytes,
 which can reduce the amount of VRAM required to process a model to the same amount
 that is used to run a typical quantized version of it, at a slight accuracy cost.
-Set the `quantization` option to `bnb_4bit` to enable this.
+This is enabled by default (`quantization = "bnb_4bit"`); set it to `"none"` to disable.
 
 Heretic is a unique tool that lets you do what only corporations with access
 to massive computing power usually do: *Modify,* rather than merely run,

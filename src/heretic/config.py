@@ -256,11 +256,13 @@ class Settings(BaseSettings):
     )
 
     quantization: QuantizationMethod = Field(
-        default=QuantizationMethod.NONE,
+        default=QuantizationMethod.BNB_4BIT,
         description=(
             "Quantization method to use when loading the model. Options: "
             '"none" (no quantization), '
-            '"bnb_4bit" (4-bit quantization using bitsandbytes).'
+            '"bnb_4bit" (4-bit quantization using bitsandbytes). '
+            "4-bit is the default because CPU-bound decode is memory-bandwidth "
+            "bound: quantized weights roughly halve the bytes streamed per token."
         ),
     )
 

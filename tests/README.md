@@ -62,6 +62,9 @@ Where `LABEL` describes the type of system you are running the tests on.
 uv run run_tests.py
 ```
 
+> [!NOTE]
+> On the dev box run with `CUDA_VISIBLE_DEVICES=-1` (CPU-only merges reproduce `SHA256SUMS.windows`). Exception: `tests/qwen3.5-moe` needs `CUDA_VISIBLE_DEVICES=` (empty string) because its fla/triton stack requires a CUDA driver.
+
 The output hashes *should FAIL* against the `Valid hashes` in `SHA256SUMS` file of the test model you added. This is expected since Heretic changes the model. Without **Step 2**, the test model's folder will simply be ignored because it will not have a hash SUMS file to compare against.
 
 4. After that go to the output `TEST_MODEL_DIR/model` folder and re-generate the Actual hashes based on the system you are using.

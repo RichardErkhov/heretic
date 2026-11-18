@@ -19,7 +19,9 @@ dtypes = [
 # Quantization method to use when loading the model. Options:
 # "none" (no quantization),
 # "bnb_4bit" (4-bit quantization using bitsandbytes).
-quantization = "none"
+# bnb_4bit is the default: CPU-bound decoding is memory-bandwidth bound,
+# so quantized weights roughly halve the time per generated token.
+quantization = "bnb_4bit"
 
 # Device map to pass to Accelerate when loading the model.
 device_map = "auto"
