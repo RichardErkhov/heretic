@@ -1400,6 +1400,42 @@ class Model:
     def _finish_pass(self) -> None:
         self._progress_bar().update(1)
 
+    def _wire_hop_loads(self) -> None:
+        # Every decode step drives the hook loader again; make it start from the
+        # pinned snapshot made during the init pass so steps after the first
+        # copy weights from RAM instead of re-reading safetensors per step.
+        compute = self.compute_device
+        hop = self._hop_from_cache
+        capture = self._capture_pinned
+        for layer in self.get_layers():
+            # accelerate attaches its own hook to nested blocks (attention /
+            # mlp submodules), not just the top layer: every hook has to see
+            # the hop first, or its plain reload rebuilds from the meta-mutated
+            # quant state the eviction leaves behind. The `_heretic_hop_first`
+            # flag on the hook object dedups hooks shared across modules.
+            for module in [layer, *layer.modules()]:
+                hook = getattr(module, "_hf_hook", None)
+                if hook is None or getattr(hook, "_heretic_hop_first", False):
+                    continue
+                hook._heretic_hop_first = True
+                hook.tied_pointers_to_remove = getattr(hook, "tied_pointers_to_remove", set())
+                load = hook.pre_forward
+
+                def hop_first(module: Module, *args: Any, _hook=hook, _load=load, _hop=hop, _cap=capture, _dev=compute, **kwargs: Any) -> Any:
+                    # Hop hit leaves real weights on the compute device, so skip
+                    # the hook's pageable reload and only align the call args the
+                    # way its own pre_forward does. Miss keeps the original loader
+                    # path and snapshots the fresh weights for the next hop.
+                    if _hop(module, _dev, None) is True:
+                        if _hook.io_same_device:
+                            _hook.input_device = find_device([args, kwargs])
+                        return send_to_device(args, _dev), send_to_device(kwargs, _dev, skip_keys=_hook.skip_keys)
+                    out = _load(module, *args, **kwargs)
+                    _cap(module)
+                    return out
+
+                hook.pre_forward = hop_first
+
     def _apply_head(self, lm_head: Module, hidden_states: Tensor) -> Tensor:
         # The dispatch loader re-materializes the head weight on every forward;
         # apply it functionally from one GPU-resident copy instead. Anything the
@@ -1433,6 +1469,9 @@ class Model:
         last prompt position for each layer boundary that Transformers records
         (embedding output, intermediate layer outputs, final norm output), plus logits.
         """
+        # Scoring passes drive the vanilla hook loader too; give it the same
+        # pinned hop so second-touch reloads skip the mutated meta state.
+        self._wire_hop_loads()
         with torch.no_grad():
             if self.stream_fallback_reason is None:
                 try:
@@ -1539,9 +1578,13 @@ class Model:
                 padding=True,
                 return_token_type_ids=False,
             )
-            input_ids = inputs["input_ids"].to(device)
             attention_mask = inputs["attention_mask"].to(device)
-            hidden_states = embedding(input_ids)
+            input_ids = inputs["input_ids"]
+            # accelerate dispatch may rest embedding weights off the compute device (disk bucket leaves meta placeholders whose loader fills them on CPU); feed each module its own resting device and pull activations back onto the compute device afterwards.
+            emb_weight = next(embedding.parameters(), None)
+            hidden_states = embedding(
+                input_ids.to(emb_weight.device) if emb_weight is not None and not emb_weight.is_meta else input_ids.to(device)
+            ).to(device)
 
             # Mirror the model's own forward pass exactly: Transformers 5 derives
             # padding-aware position ids and attention masks via the helpers in
@@ -1597,6 +1640,7 @@ class Model:
                     position_embeddings = rotary_embedding(
                         hidden_states, position_ids[None, ...].expand(3, -1, -1)
                     )
+                position_embeddings = tuple(t.to(device) for t in position_embeddings)
 
             kwargs: dict[str, Any] = {"position_ids": position_ids}
             if position_embeddings is not None:
@@ -1625,7 +1669,7 @@ class Model:
         # their later hop starts warm. On CPU-only boxes both stages are the
         # same hop.
         resting = {id(layer): next(layer.parameters()).device for layer in layers}
-        side = torch.cuda.Stream() if _cuda_usable() else None
+        side = None  # side-stream hops fault under async launches (illegal address); single ordered stream is stable
         pending: list[tuple[int, Future | None]] = []
 
         # Leading layers keep identical weights across trials (modifiers touch
@@ -1721,7 +1765,7 @@ class Model:
         last_rows = torch.cat([state["hidden"][:, -1, :].detach() for state in states])
 
         if norm is not None:
-            last_rows = norm(last_rows)
+            last_rows = norm(last_rows).to(device)
 
         offset = 0
         for state in states:
@@ -1752,6 +1796,11 @@ class Model:
         # layer's own window skips the redundant reload (see _call_layer).
         # Peak stays ~four largest layers + activations. The copy is ordered
         # behind the current compute on the compute stream, so no event needed.
+        if side is not None:
+            # Seed activations were enqueued on the compute stream, which is
+            # unordered against this side stream; wait so the worker never
+            # reads a half-written hidden state.
+            side.wait_stream(torch.cuda.current_stream())
         hook = getattr(layer, "_hf_hook", None)
         if hook is not None:
             # Accelerate fills a lazy offload map on the layer's first pre_forward;
@@ -1811,8 +1860,34 @@ class Model:
             return None
         event = torch.cuda.Event() if side is not None else None
         with torch.cuda.stream(side) if side is not None else suppress():
-            for name, buf in cache.items():
-                set_module_tensor_to_device(layer, name, device, value=buf, non_blocking=side is not None)
+            placed: list[Tensor] = []
+            for name, entry in cache.items():
+                parts = name.split(".")
+                owner: Any = layer
+                for part in parts[:-1]:
+                    owner = getattr(owner, part)
+                if isinstance(entry, tuple):
+                    from bitsandbytes.nn import Params4bit
+                    # bnb keeps the nf4 scale/absmax state beside the packed bytes,
+                    # and the eviction's `.to("meta")` mutates that shared state
+                    # in place, so every later rebuild trips over the empty
+                    # placeholder. Rebuild a fresh QuantState from the CPU copy
+                    # saved at capture time instead of letting accelerate wrap
+                    # the meta old value again.
+                    buf, stats = entry
+                    setattr(
+                        owner, parts[-1], Params4bit.from_prequantized(buf.to(device), stats, device=device, module=owner)
+                    )
+                else:
+                    set_module_tensor_to_device(owner, parts[-1], device, value=entry, non_blocking=side is not None)
+                placed.append(getattr(owner, parts[-1]))
+            if side is not None:
+                # Blocks allocated on the side stream are read by compute-stream
+                # kernels; register that reader so the allocator does not hand
+                # this memory to the next hop while a forward still uses it.
+                reader = torch.cuda.default_stream(device)
+                for tensor in placed:
+                    tensor.record_stream(reader)
         if event is None:
             # Synchronous hop hit: truthy tells callers the weights landed so
             # they skip accelerate's pageable safetensors reload entirely.
@@ -1826,18 +1901,54 @@ class Model:
         # the streamed layers; allocation failure keeps the loader path.
         if id(layer) in self._pin_cache or not _cuda_usable():
             return
-        cache: dict[str, Tensor] = {}
+        cache: dict[str, Any] = {}
         try:
             for name, tensor in named_module_tensors(layer, include_buffers=True, recurse=True):
                 if tensor.is_meta:
                     continue
+                quant_state = getattr(tensor, "quant_state", None)
                 buf = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
                 buf.copy_(tensor.detach(), non_blocking=True)
-                cache[name] = buf
+                if quant_state is None:
+                    cache[name] = buf
+                else:
+                    # One-time snapshot of the bnb quantization state next
+                    # to the packed bytes. Eviction's `.to("meta")` mutates
+                    # the live QuantState and accelerate rebuilds the next
+                    # Params4bit from that broken copy on the placeholder,
+                    # so keep a CPU state here for `_restore_quant_states`.
+                    # State tensors are tiny: one fp32 scale per 64 weights
+                    # plus the nf4 lookup table.
+                    stats = {k: v.cpu().clone() if isinstance(v, Tensor) else v for k, v in quant_state.as_dict().items()}
+                    cache[name] = (buf, stats)
             torch.cuda.current_stream().synchronize()
         except Exception:
             return
         self._pin_cache[id(layer)] = cache
+
+    def _restore_quant_states(self, layer: Module) -> None:
+        # Eviction's `.to("meta")` mutates the shared QuantState in place; a
+        # later plain accelerate reload rebuilds from that state copy on the
+        # placeholder and trips over the empty tensors. Hand every quantized
+        # placeholder a fresh CPU state from the capture stats.
+        cache = self._pin_cache.get(id(layer))
+        if cache is None:
+            return
+        try:
+            from bitsandbytes.functional import QuantState
+
+            for name, entry in cache.items():
+                if not isinstance(entry, tuple):
+                    continue
+                parts = name.split(".")
+                owner: Any = layer
+                for part in parts[:-1]:
+                    owner = getattr(owner, part)
+                param = getattr(owner, parts[-1], None)
+                if getattr(param, "quant_state", None) is not None:
+                    param.quant_state = QuantState.from_dict(dict(entry[1]), torch.device("cpu"))
+        except Exception:
+            return
 
     def _hold_layer(self, layer: Module, origin: Any, hook: Any) -> bool:
         if not self._hold_enabled:
@@ -1868,6 +1979,7 @@ class Model:
                 hook.post_forward(layer, None)
             elif next(layer.parameters()).device != origin:
                 layer.to(origin)
+            self._restore_quant_states(layer)
         self._held.clear()
         empty_cache()
 
@@ -2012,6 +2124,7 @@ class Model:
                 if moved:
                     layer.to(origin)
                     empty_cache()
+                self._restore_quant_states(layer)
 
     def _eager_forward_once(self, prompts: list[Prompt]) -> tuple[list[Tensor], Tensor]:
         _, outputs = self._eager_generate(
@@ -2062,34 +2175,8 @@ class Model:
             skip_special_tokens=True,
         )
 
-        # Every decode step drives the hook loader again; make it start from the
-        # pinned snapshot made during the init pass so steps after the first
-        # copy weights from RAM instead of re-reading safetensors per step.
-        compute = self.compute_device
-        hop = self._hop_from_cache
-        capture = self._capture_pinned
-        for layer in self.get_layers():
-            hook = getattr(layer, "_hf_hook", None)
-            if hook is None or getattr(hook, "_heretic_hop_first", False):
-                continue
-            hook._heretic_hop_first = True
-            hook.tied_pointers_to_remove = getattr(hook, "tied_pointers_to_remove", set())
-            load = hook.pre_forward
-
-            def hop_first(module: Module, *args: Any, _hook=hook, _load=load, _hop=hop, _cap=capture, _dev=compute, **kwargs: Any) -> Any:
-                # Hop hit leaves real weights on the compute device, so skip
-                # the hook's pageable reload and only align the call args the
-                # way its own pre_forward does. Miss keeps the original loader
-                # path and snapshots the fresh weights for the next hop.
-                if _hop(module, _dev, None) is True:
-                    if _hook.io_same_device:
-                        _hook.input_device = find_device([args, kwargs])
-                    return send_to_device(args, _dev), send_to_device(kwargs, _dev, skip_keys=_hook.skip_keys)
-                out = _load(module, *args, **kwargs)
-                _cap(module)
-                return out
-
-            hook.pre_forward = hop_first
+        # Hop-start wiring shared with the scoring passes (see _wire_hop_loads).
+        self._wire_hop_loads()
 
         # FIXME: The type checker has been disabled here because of the extremely complex
         #        interplay between different generate() signatures and dynamic delegation.

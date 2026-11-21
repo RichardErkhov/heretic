@@ -63,7 +63,7 @@ uv run run_tests.py
 ```
 
 > [!NOTE]
-> On the dev box run with `CUDA_VISIBLE_DEVICES=-1` (CPU-only merges reproduce `SHA256SUMS.windows`). Exception: `tests/qwen3.5-moe` needs `CUDA_VISIBLE_DEVICES=` (empty string) because its fla/triton stack requires a CUDA driver.
+> On the dev box run with `CUDA_VISIBLE_DEVICES=-1` (CPU-only merges reproduce `SHA256SUMS.windows`). Exception: `tests/qwen3.5-moe` needs `CUDA_VISIBLE_DEVICES=0` because its fla/triton stack requires a visible CUDA driver; the empty string `CUDA_VISIBLE_DEVICES=` half-hides the GPU under PyTorch ≥ 2.15 (`is_available()` true, `device_count()` 0) and breaks bitsandbytes loading there.
 
 The output hashes *should FAIL* against the `Valid hashes` in `SHA256SUMS` file of the test model you added. This is expected since Heretic changes the model. Without **Step 2**, the test model's folder will simply be ignored because it will not have a hash SUMS file to compare against.
 

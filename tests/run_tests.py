@@ -2,6 +2,7 @@
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
 import hashlib
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -38,6 +39,12 @@ for test_directory in script_directory.iterdir():
             print("#" * 50)
             print()
 
+            # fla (used by qwen3.5-moe) needs a visible CUDA driver even when the
+            # CPU-only merge is wanted, unlike the other fixtures.
+            env = None
+            if test_directory.name == "qwen3.5-moe":
+                env = {**os.environ, "CUDA_VISIBLE_DEVICES": "0"}
+
             subprocess.run(
                 [
                     "uv",
@@ -50,6 +57,7 @@ for test_directory in script_directory.iterdir():
                     "heretic",
                 ],
                 check=True,
+                env=env,
             )
 
             print()
