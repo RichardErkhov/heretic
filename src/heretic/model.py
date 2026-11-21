@@ -166,11 +166,10 @@ def _cuda_usable() -> bool:
 # lookahead window; pinned staging is per tensor, so workers share no buffers. The
 # drain joins per event, so completion order between workers does not matter. shortcut:
 # one pool per process; add per-device pools if multi-GPU streaming ever needs parallel hops.
-# Default window matches the pool: three layers ahead so a worker always has
-# one queued while the current hop uploads. The bs=2 reload rounds measured a
-# ~2.5s avg gain over a two-layer window (avg 50.8s vs 53.3s paired rounds);
-# compute-bound rounds (bs=128) are unaffected. Tune per host with
-# HERETIC_PREFETCH_DEPTH.
+# Default window is one layer ahead: hop hits replay from the pinned cache at PCIe
+# bandwidth (~25ms per 417MB layer), so deeper windows only park more layers in VRAM
+# and add seed-forward overhead. Paired bs=128 decode rounds preferred depth 1 over 3
+# over 6 (means 390s / 397s / 405s). Tune per host with HERETIC_PREFETCH_DEPTH.
 _POOL = ThreadPoolExecutor(max_workers=3, thread_name_prefix="heretic-prefetch")
 
 # Pinned staging ring per (shape, dtype): the caching host allocator does not
@@ -338,7 +337,7 @@ class Model:
         self.stream_fallback_reason: str | None = None
         self._hold_enabled = False
         self._held: dict[int, tuple[Module, Any]] = {}
-        self._pin_cache: dict[int, dict[str, Tensor]] = {}
+        self._pin_cache: dict[int, tuple[Tensor, list[Any]]] = {}
 
         self.revision_kwargs = {}
         if settings.model_commit is not None:
@@ -1662,7 +1661,7 @@ class Model:
         ]
 
         # Each layer's resting device, so layers whose upload happened in the
-        # prefetch are still evicted after use. Prefetch window: three layers
+        # prefetch are still evicted after use. Prefetch window defaults to one layer
         # ahead. The next layer is fully loaded onto the compute device while
         # this layer's chunks drain (side-stream copy on GPU boxes); the two
         # behind it only get their weights read through the loader once, so
@@ -1720,7 +1719,7 @@ class Model:
             for state, hidden in zip(states, hidden_states_list):
                 state["hidden"] = hidden
 
-            depth = int(os.environ.get("HERETIC_PREFETCH_DEPTH", "3"))
+            depth = int(os.environ.get("HERETIC_PREFETCH_DEPTH", "1"))
             ahead = layers[index + 1 : index + 1 + depth]
             if ahead:
                 # Full-upload the whole window; read-only warming is close to a
@@ -1850,44 +1849,38 @@ class Model:
         return event
 
     def _hop_from_cache(self, layer: Module, device: Any, side: Any) -> Any:
-        # Steady-state hop for streamed layers: copy the pinned host snapshot
-        # made at the first eviction straight onto the compute device. Skips
-        # accelerate's pageable safetensors reload for hooks without a weights
-        # map and the plain CPU->GPU move for hook-less layers. Same values as
-        # the loader would produce: the buffer holds exactly what was evicted.
+        # Steady-state hop for streamed layers: upload the layer's one flat
+        # pinned snapshot with a single bulk copy, then re-point every tensor
+        # at its slice. Skips accelerate's pageable safetensors reload for
+        # hooks without a weights map and the plain CPU->GPU move for hook-less
+        # layers. Same values as the loader would produce: the buffer holds
+        # exactly what was evicted.
         cache = self._pin_cache.get(id(layer))
         if cache is None:
             return None
+        flat, entries = cache
         event = torch.cuda.Event() if side is not None else None
         with torch.cuda.stream(side) if side is not None else suppress():
-            placed: list[Tensor] = []
-            for name, entry in cache.items():
+            dev_flat = flat.to(device, non_blocking=side is not None)
+            for name, offset, words, shape, dtype, stats in entries:
+                view = dev_flat.narrow(0, offset, words).view(dtype).view(shape)
                 parts = name.split(".")
                 owner: Any = layer
                 for part in parts[:-1]:
                     owner = getattr(owner, part)
-                if isinstance(entry, tuple):
-                    from bitsandbytes.nn import Params4bit
-                    # bnb keeps the nf4 scale/absmax state beside the packed bytes,
-                    # and the eviction's `.to("meta")` mutates that shared state
-                    # in place, so every later rebuild trips over the empty
-                    # placeholder. Rebuild a fresh QuantState from the CPU copy
-                    # saved at capture time instead of letting accelerate wrap
-                    # the meta old value again.
-                    buf, stats = entry
-                    setattr(
-                        owner, parts[-1], Params4bit.from_prequantized(buf.to(device), stats, device=device, module=owner)
-                    )
+                if stats is None:
+                    set_module_tensor_to_device(owner, parts[-1], device, value=view, non_blocking=side is not None)
                 else:
-                    set_module_tensor_to_device(owner, parts[-1], device, value=entry, non_blocking=side is not None)
-                placed.append(getattr(owner, parts[-1]))
+                    from bitsandbytes.nn import Params4bit
+                    # Eviction's `.to("meta")` mutated the shared QuantState,
+                    # so rebuild from the CPU dict taken at snapshot time
+                    # instead of the broken live state.
+                    setattr(owner, parts[-1], Params4bit.from_prequantized(view, stats, device=device, module=owner))
             if side is not None:
-                # Blocks allocated on the side stream are read by compute-stream
-                # kernels; register that reader so the allocator does not hand
-                # this memory to the next hop while a forward still uses it.
-                reader = torch.cuda.default_stream(device)
-                for tensor in placed:
-                    tensor.record_stream(reader)
+                # The slice views are read by compute-stream kernels; register
+                # that reader on the one backing buffer so the allocator does
+                # not hand it to the next hop while a forward still uses it.
+                dev_flat.record_stream(torch.cuda.default_stream(device))
         if event is None:
             # Synchronous hop hit: truthy tells callers the weights landed so
             # they skip accelerate's pageable safetensors reload entirely.
@@ -1896,35 +1889,40 @@ class Model:
         return event
 
     def _capture_pinned(self, layer: Module) -> None:
-        # One-time pinned host snapshot per layer, taken while the weights are
-        # still on the compute device. Total pinned RAM is about one copy of
-        # the streamed layers; allocation failure keeps the loader path.
+        # One-time pinned snapshot per layer: pack every tensor into a single
+        # flat pinned buffer so each hop is one bulk upload plus cheap views,
+        # instead of one pageable copy per tensor. Odd-byte tensors cannot be
+        # bf16-viewed and drop the whole capture, keeping the loader path.
+        # Total pinned RAM is about one copy of the streamed layers.
         if id(layer) in self._pin_cache or not _cuda_usable():
             return
-        cache: dict[str, Any] = {}
+        gathered: list[tuple[Tensor, tuple[Any, ...]]] = []
+        total = 0
         try:
             for name, tensor in named_module_tensors(layer, include_buffers=True, recurse=True):
                 if tensor.is_meta:
                     continue
+                src = tensor.detach().reshape(-1).view(torch.bfloat16)
                 quant_state = getattr(tensor, "quant_state", None)
-                buf = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
-                buf.copy_(tensor.detach(), non_blocking=True)
-                if quant_state is None:
-                    cache[name] = buf
-                else:
-                    # One-time snapshot of the bnb quantization state next
-                    # to the packed bytes. Eviction's `.to("meta")` mutates
-                    # the live QuantState and accelerate rebuilds the next
-                    # Params4bit from that broken copy on the placeholder,
-                    # so keep a CPU state here for `_restore_quant_states`.
-                    # State tensors are tiny: one fp32 scale per 64 weights
-                    # plus the nf4 lookup table.
+                stats = None
+                if quant_state is not None:
+                    # One-time snapshot of the bnb quantization state beside
+                    # the packed bytes: eviction's `.to("meta")` mutates the
+                    # live QuantState in place, so keep a CPU dict here for
+                    # `_hop_from_cache` / `_restore_quant_states` rebuilds.
                     stats = {k: v.cpu().clone() if isinstance(v, Tensor) else v for k, v in quant_state.as_dict().items()}
-                    cache[name] = (buf, stats)
+                gathered.append((src, (name, total, src.numel(), tensor.shape, tensor.dtype, stats)))
+                total += src.numel()
+        except Exception:
+            return
+        try:
+            flat = torch.empty(total, dtype=torch.bfloat16, pin_memory=True)
+            for src, (_name, offset, words, _shape, _dtype, _stats) in gathered:
+                flat.narrow(0, offset, words).copy_(src, non_blocking=True)
             torch.cuda.current_stream().synchronize()
         except Exception:
             return
-        self._pin_cache[id(layer)] = cache
+        self._pin_cache[id(layer)] = (flat, [entry for _src, entry in gathered])
 
     def _restore_quant_states(self, layer: Module) -> None:
         # Eviction's `.to("meta")` mutates the shared QuantState in place; a
@@ -1937,8 +1935,8 @@ class Model:
         try:
             from bitsandbytes.functional import QuantState
 
-            for name, entry in cache.items():
-                if not isinstance(entry, tuple):
+            for name, *_mid, stats in cache[1]:
+                if stats is None:
                     continue
                 parts = name.split(".")
                 owner: Any = layer
@@ -1946,7 +1944,7 @@ class Model:
                     owner = getattr(owner, part)
                 param = getattr(owner, parts[-1], None)
                 if getattr(param, "quant_state", None) is not None:
-                    param.quant_state = QuantState.from_dict(dict(entry[1]), torch.device("cpu"))
+                    param.quant_state = QuantState.from_dict(dict(stats), torch.device("cpu"))
         except Exception:
             return
 
